@@ -2,6 +2,7 @@ from werkzeug.wrappers import Response
 
 import frappe
 from frappe.permissions import handle_does_not_exist_error
+from frappe.utils.error import log_error_snapshot
 from frappe.website.page_renderers.error_page import ErrorPage
 from frappe.website.page_renderers.not_found_page import NotFoundPage
 from frappe.website.page_renderers.not_permitted_page import NotPermittedPage
@@ -34,7 +35,13 @@ def handle_exception(e, endpoint, path, http_status_code):
 	if isinstance(e, frappe.PageDoesNotExistError):
 		return NotFoundPage(endpoint, http_status_code).render()
 
-	return ErrorPage(exception=e).render()
+	page = ErrorPage(exception=e)
+	# A rendered error page is a handled exception, so app.py's ">= 500 -> log" rule never
+	# sees it and the real fault went unrecorded. Log BEFORE rendering, so a broken error
+	# page cannot replace it in the Error Log either (PR-Foundry/framework#267).
+	if page.http_status_code >= 500:
+		log_error_snapshot(e)
+	return page.render()
 
 
 def get_response_content(path=None, http_status_code=200) -> str:
