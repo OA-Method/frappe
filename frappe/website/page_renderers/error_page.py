@@ -6,7 +6,10 @@ class ErrorPage(TemplatePage):
 		path = "error"
 		super().__init__(path=path, http_status_code=http_status_code)
 		self.exception = exception
-		self.http_status_code = http_status_code
+		# Resolved here, not only in init_context: a render that skips it (a cached error
+		# page) otherwise hands None to werkzeug, which raises "'NoneType' object has no
+		# attribute 'strip'" in place of the real error (PR-Foundry/framework#267).
+		self.http_status_code = http_status_code or getattr(exception, "http_status_code", None) or 500
 		self.title = title
 		self.message = message
 
