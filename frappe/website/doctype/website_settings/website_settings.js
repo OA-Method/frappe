@@ -120,6 +120,14 @@ frappe.ui.form.on("Website Settings", {
 			return;
 		}
 
+		// with_doc is a full fetch and needs READ; Website Manager holds only SELECT on
+		// Web Template, so without this every load raised a permission popup
+		// (PR-Foundry/framework#266). Without read the values cannot be edited anyway.
+		if (!frappe.model.can_read("Web Template")) {
+			frm.toggle_display(button_field, false);
+			return;
+		}
+
 		frappe.model.with_doc("Web Template", template, () => {
 			let doc = frappe.model.get_doc("Web Template", template);
 			let has_fields = doc.fields && doc.fields.length > 0;
