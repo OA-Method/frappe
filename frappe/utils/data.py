@@ -13,6 +13,7 @@ import time
 import typing
 from code import compile_command
 from collections import defaultdict
+from decimal import MAX_PREC, ROUND_HALF_UP, Decimal, localcontext
 from enum import Enum
 from functools import lru_cache
 from typing import Any, Literal, Optional, TypeVar
@@ -58,6 +59,7 @@ if typing.TYPE_CHECKING:
 	from collections.abc import Mapping
 
 	from PIL.ImageFile import ImageFile as PILImageFile
+	from werkzeug.wrappers import Request
 
 	T = TypeVar("T")
 
@@ -1302,7 +1304,8 @@ def _round_away_from_zero(num, precision):
 	# ending with 5 when it's represented by a smaller number. By adding a very small value
 	# close to what's "least count" or smallest representable difference in the scale we force
 	# the number to be bigger than actual value, this increases representation error but
-	# removes rounding error.
+	# removes rounding error. This only holds while the correction stays under the rounding
+	# step, past a quarter step it inflates the value instead, so the value is rounded exactly.
 
 	# References:
 	# - https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html
@@ -1310,7 +1313,14 @@ def _round_away_from_zero(num, precision):
 	# - https://docs.python.org/3/library/functions.html#round
 	# - easier to understand: https://www.youtube.com/watch?v=pQs_wx8eoQ8
 
-	epsilon = 2.0 ** (math.log(abs(num), 2) - 52.0)
+	epsilon = math.ulp(abs(num))
+	rounding_step = 10.0**-precision
+
+	if math.isfinite(num) and epsilon >= rounding_step / 4:
+		with localcontext() as ctx:
+			ctx.prec = MAX_PREC
+			ctx.rounding = ROUND_HALF_UP
+			return float(Decimal(num).quantize(Decimal(1).scaleb(-precision)))
 
 	return round(num + math.copysign(epsilon, num), precision)
 
@@ -1330,7 +1340,8 @@ def _bankers_rounding(num, precision):
 	decimal_part = num - floor_num
 
 	epsilon = 2.0 ** (math.log(num, 2) - 52.0)
-	if abs(decimal_part - 0.5) < epsilon:
+
+	if epsilon < 0.5 and abs(decimal_part - 0.5) < epsilon:
 		num = floor_num if (floor_num % 2 == 0) else floor_num + 1
 	else:
 		num = round(num)
@@ -1408,6 +1419,12 @@ def parse_val(v):
 	return v
 
 
+def get_currency_precision() -> int | None:
+	"""Return the configured Currency Precision, or None if it isn't set."""
+	currency_precision = frappe.db.get_default("currency_precision")
+	return cint(currency_precision) if currency_precision not in (None, "") else None
+
+
 def fmt_money(
 	amount: str | float | int | None,
 	precision: int | None = None,
@@ -1418,7 +1435,7 @@ def fmt_money(
 	number_format = NumberFormat.from_string(format) if format else get_number_format()
 
 	if precision is None:
-		precision = cint(frappe.db.get_default("currency_precision")) or None
+		precision = get_currency_precision()
 
 	if precision is None:
 		precision = number_format.precision
@@ -1697,13 +1714,9 @@ def get_image_thumbnail_uri(url: str, max_dim: int = 400, quality: int = 80) -> 
 
 	try:
 		if url.startswith("/"):
-			path = None
-			for prefix in ("public", "private"):
-				candidate = frappe.get_site_path(prefix, url.lstrip("/"))
-				if os.path.exists(candidate):
-					path = candidate
-					break
-			if not path:
+			base = os.path.abspath(frappe.get_site_path("public"))
+			path = os.path.abspath(os.path.join(base, url.lstrip("/")))
+			if os.path.commonpath((base, path)) != base or not os.path.isfile(path):
 				return url
 			with open(path, "rb") as f:
 				content = f.read()
@@ -1884,7 +1897,7 @@ def comma_or(some_list: list | tuple, add_quotes=True) -> str:
 
 	try:
 		locale = Locale.parse(frappe.local.lang, sep="-")
-		pattern = locale.list_patterns["or"]["end"]
+		pattern = locale.list_patterns["or"]["2" if len(some_list) == 2 else "end"]
 	except Exception:
 		pattern = frappe._("{0} or {1}")
 
@@ -1902,7 +1915,7 @@ def comma_and(some_list: list | tuple, add_quotes=True) -> str:
 
 	try:
 		locale = Locale.parse(frappe.local.lang, sep="-")
-		pattern = locale.list_patterns["standard"]["end"]
+		pattern = locale.list_patterns["standard"]["2" if len(some_list) == 2 else "end"]
 	except Exception:
 		pattern = frappe._("{0} and {1}")
 
@@ -2019,11 +2032,19 @@ def get_url(
 	return urljoin(host_name, uri) if uri else host_name
 
 
+def get_request_host(request: "Request") -> str:
+	return request.host or request.headers.get("Host", "")
+
+
 def get_host_name_from_request() -> str:
 	"""Return the hostname (`request.host`) from the request headers."""
-	if hasattr(frappe.local, "request") and frappe.local.request and frappe.local.request.host:
+	if (
+		hasattr(frappe.local, "request")
+		and frappe.local.request
+		and (host := get_request_host(frappe.local.request))
+	):
 		protocol = "https://" if "https" == frappe.get_request_header("X-Forwarded-Proto", "") else "http://"
-		return protocol + frappe.local.request.host
+		return protocol + host
 
 
 def url_contains_port(url: str) -> bool:
@@ -2119,7 +2140,7 @@ def get_absolute_url(doctype: str, name: str) -> str:
 
 	e.g. when doctype="Sales Invoice" and name="INV-00001", returns '/desk/sales-invoice/INV-00001'
 	"""
-	return f"/desk/{quoted(slug(doctype))}/{quoted(name)}"
+	return f"/desk/{quoted(slug(doctype))}/{quote(cstr(name), safe='')}"
 
 
 def get_url_to_form(doctype: str, name: str | None = None) -> str:
@@ -2131,7 +2152,7 @@ def get_url_to_form(doctype: str, name: str | None = None) -> str:
 	if not name:
 		uri = f"/desk/{quoted(slug(doctype))}"
 	else:
-		uri = f"/desk/{quoted(slug(doctype))}/{quoted(name)}"
+		uri = f"/desk/{quoted(slug(doctype))}/{quote(cstr(name), safe='')}"
 
 	return get_url(uri=uri)
 
@@ -2156,9 +2177,9 @@ def get_url_to_report(name, report_type: str | None = None, doctype: str | None 
 	get_url_to_report("Revenue", "Report Builder", "Sales Invoice") -> 'https://frappe.io/desk/sales-invoice/view/report/Revenue'
 	"""
 	if report_type == "Report Builder":
-		return get_url(uri=f"/desk/{quoted(slug(doctype))}/view/report/{quoted(name)}")
+		return get_url(uri=f"/desk/{quoted(slug(doctype))}/view/report/{quote(cstr(name), safe='')}")
 	else:
-		return get_url(uri=f"/desk/query-report/{quoted(name)}")
+		return get_url(uri=f"/desk/query-report/{quote(cstr(name), safe='')}")
 
 
 def get_url_to_report_with_filters(name, filters, report_type=None, doctype=None):
@@ -2166,7 +2187,7 @@ def get_url_to_report_with_filters(name, filters, report_type=None, doctype=None
 	if report_type == "Report Builder":
 		return get_url(uri=f"/desk/{quoted(slug(doctype))}/view/report?{filters}")
 
-	return get_url(uri=f"/desk/query-report/{quoted(name)}?{filters}")
+	return get_url(uri=f"/desk/query-report/{quote(cstr(name), safe='')}?{filters}")
 
 
 def get_filtered_list_url(doctype: str, docnames: list[str] | None = None) -> str:
@@ -2635,6 +2656,11 @@ def sha256_hash(input: str | bytes) -> str:
 	if isinstance(input, str):
 		input = input.encode()
 	return hashlib.sha256(input).hexdigest()
+
+
+def is_sha256_hash(value: str) -> bool:
+	"""Return True if `value` has the shape of a sha256 hexdigest."""
+	return len(value) == 64 and all(character in "0123456789abcdef" for character in value.lower())
 
 
 def dict_with_keys(dict, keys):

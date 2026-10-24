@@ -9,7 +9,7 @@ from frappe.core.doctype.access_log.access_log import make_access_log
 from frappe.core.doctype.dynamic_link.dynamic_link import deduplicate_dynamic_links
 from frappe.model.document import Document
 from frappe.model.naming import append_number_if_name_exists
-from frappe.query_builder.functions import Coalesce
+from frappe.query_builder.functions import Coalesce, Locate, Lower, NullIf
 from frappe.utils import cstr
 
 
@@ -405,39 +405,54 @@ def update_contact(doc, method):
 def contact_query(
 	doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict[str, Any]
 ):
-	from frappe.desk.reportview import get_match_cond
-
 	doctype = "Contact"
 	if not frappe.get_meta(doctype).get_field(searchfield) and searchfield not in frappe.db.DEFAULT_COLUMNS:
 		return []
 
-	link_doctype = filters.pop("link_doctype", None)
-	link_name = filters.pop("link_name", None)
+	link_doctype = filters.get("link_doctype")
+	link_name = filters.get("link_name")
+	if not (link_doctype and link_name):
+		return []
 
-	return frappe.db.sql(
-		f"""select
-			`tabContact`.name, `tabContact`.full_name, `tabContact`.company_name
-		from
-			`tabContact`, `tabDynamic Link`
-		where
-			`tabDynamic Link`.parent = `tabContact`.name and
-			`tabDynamic Link`.parenttype = 'Contact' and
-			`tabDynamic Link`.link_doctype = %(link_doctype)s and
-			`tabDynamic Link`.link_name = %(link_name)s and
-			`tabContact`.`{searchfield}` like %(txt)s
-			{get_match_cond(doctype)}
-		order by
-			if(locate(%(_txt)s, `tabContact`.full_name), locate(%(_txt)s, `tabContact`.company_name), 99999),
-			`tabContact`.idx desc, `tabContact`.full_name
-		limit %(page_len)s offset %(start)s """,
-		{
-			"txt": "%" + txt + "%",
-			"_txt": txt.replace("%", ""),
-			"start": start,
-			"page_len": page_len,
-			"link_name": link_name,
-			"link_doctype": link_doctype,
-		},
+	Contact = frappe.qb.DocType(doctype)
+	query = frappe.qb.get_query(
+		Contact,
+		fields=[Contact.name, Contact.full_name, Contact.company_name],
+		filters=[
+			[Contact[searchfield], "like", f"%{txt}%"],
+			Contact.name.isin(get_linked_contacts_query(link_doctype, link_name)),
+		],
+		limit=page_len,
+		offset=start,
+		ignore_permissions=False,
+	)
+
+	if txt:
+		# Locate is case-sensitive on Postgres, unlike the LIKE filter
+		search_text = Lower(txt.replace("%", ""))
+		full_name_position = NullIf(Locate(search_text, Lower(Contact.full_name)), 0)
+		company_name_position = NullIf(Locate(search_text, Lower(Contact.company_name)), 0)
+		relevance = (
+			frappe.qb.terms.Case()
+			.when(full_name_position.isnull(), Coalesce(company_name_position, 99999))
+			.when(company_name_position.isnull(), full_name_position)
+			.when(full_name_position <= company_name_position, full_name_position)
+			.else_(company_name_position)
+		)
+		query = query.orderby(relevance)
+
+	return query.orderby(Contact.idx, order=frappe.qb.desc).orderby(Contact.full_name).run()
+
+
+def get_linked_contacts_query(link_doctype: str, link_name: str):
+	"""Return a subquery of Contact names linked to the given document."""
+	DynamicLink = frappe.qb.DocType("Dynamic Link")
+	return (
+		frappe.qb.from_(DynamicLink)
+		.select(DynamicLink.parent)
+		.where(DynamicLink.parenttype == "Contact")
+		.where(DynamicLink.link_doctype == link_doctype)
+		.where(DynamicLink.link_name == link_name)
 	)
 
 

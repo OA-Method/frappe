@@ -255,7 +255,7 @@ def set_naming_from_document_naming_rule(doc):
 	"""
 	Evaluate rules based on "Document Naming Series" doctype
 	"""
-	from frappe.model.base_document import DOCTYPES_FOR_DOCTYPE
+	from frappe.model.document import DOCTYPES_FOR_DOCTYPE
 
 	IGNORED_DOCTYPES = {*log_types, *DOCTYPES_FOR_DOCTYPE, "DefaultValue", "Patch Log"}
 
@@ -426,6 +426,15 @@ def determine_consecutive_week_number(datetime):
 
 
 def getseries(key, digits):
+	if frappe.db.db_type == "sqlite":
+		current = frappe.db.sql(
+			"""INSERT INTO `tabSeries` (`name`, `current`) VALUES (%s, 1)
+			ON CONFLICT (`name`) DO UPDATE SET `current` = `current` + 1
+			RETURNING `current`""",
+			(key,),
+		)[0][0]
+		return ("%0" + str(digits) + "d") % current
+
 	# series created ?
 	# Using frappe.qb as frappe.get_values does not allow order_by=None
 	series = DocType("Series")

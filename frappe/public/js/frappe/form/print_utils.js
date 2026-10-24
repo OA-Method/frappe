@@ -3,9 +3,10 @@ frappe.ui.get_print_settings = function (
 	callback,
 	letter_head,
 	pick_columns,
-	has_filters = false,
+	is_query_report = false,
 	title = null,
-	default_print_format = null
+	default_print_format = null,
+	can_include_filters = is_query_report
 ) {
 	var print_settings = locals[":Print Settings"]["Print Settings"];
 
@@ -31,24 +32,6 @@ frappe.ui.get_print_settings = function (
 			default: "Landscape",
 		},
 		{
-			fieldtype: "Link",
-			fieldname: "print_format",
-			label: __("Print Format"),
-			options: "Print Format",
-			default: default_print_format,
-			description: __(
-				"If no Print Format is selected, the default template for this report will be used."
-			),
-			get_query: () => ({
-				filters: {
-					print_format_for: "Report",
-					print_format_type: "JS",
-					report: frappe.query_report ? frappe.query_report.report_name : "",
-					disabled: 0,
-				},
-			}),
-		},
-		{
 			fieldtype: "Check",
 			fieldname: "with_letter_head",
 			label: __("With Letter Head"),
@@ -72,12 +55,32 @@ frappe.ui.get_print_settings = function (
 		},
 	];
 
-	if (has_filters) {
+	// Print format only applies to query/script reports.
+	if (is_query_report) {
+		columns.splice(1, 0, {
+			fieldtype: "Link",
+			fieldname: "print_format",
+			label: __("Print Format"),
+			options: "Print Format",
+			default: default_print_format,
+			description: __(
+				"If no Print Format is selected, the default template for this report will be used."
+			),
+			get_query: () => ({
+				filters: {
+					print_format_for: "Report",
+					report: frappe.query_report ? frappe.query_report.report_name : "",
+					disabled: 0,
+				},
+			}),
+		});
+	}
+
+	if (can_include_filters) {
 		columns.push({
 			label: __("Include filters"),
 			fieldtype: "Check",
 			fieldname: "include_filters",
-			depends_on: "eval: !doc.print_format",
 			default: 1,
 		});
 	}

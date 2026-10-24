@@ -2,8 +2,9 @@ from datetime import datetime, time, timedelta
 from typing import Any
 
 from pypika.dialects import SQLLiteValueWrapper
+from pypika.enums import Comparator, Dialects
 from pypika.queries import QueryBuilder
-from pypika.terms import Criterion, Function, ValueWrapper
+from pypika.terms import BasicCriterion, Criterion, Function, Term, ValueWrapper
 from pypika.utils import format_alias_sql
 
 import frappe
@@ -63,6 +64,10 @@ class ParameterizedValueWrapper(ValueWrapper):
 				self.value = format_time(self.value)
 			elif isinstance(self.value, datetime):
 				self.value = frappe.db.format_datetime(self.value)
+			elif isinstance(self.value, bool):
+				# emit '1'/'0': fits both `SET check_field = '1'` (smallint) and
+				# `WHERE ... OR '0'` (a condition), where postgres rejects a bare 1
+				self.value = str(int(self.value))
 
 			sql = self.get_value_sql(
 				quote_char=quote_char,
@@ -125,3 +130,24 @@ class SubQuery(Criterion):
 
 
 subqry = SubQuery
+
+
+class PostgresAwareCriterion(BasicCriterion):
+	def __init__(self, comparator: Comparator, postgres_comparator: Comparator, left: Term, right: Term):
+		super().__init__(comparator, left, right)
+		self.default_comparator = comparator
+		self.postgres_comparator = postgres_comparator
+
+	def get_sql(self, **kwargs: Any) -> str:
+		self.comparator = (
+			self.postgres_comparator
+			if renders_for_postgres(kwargs.get("dialect"))
+			else self.default_comparator
+		)
+		return super().get_sql(**kwargs)
+
+
+def renders_for_postgres(dialect: Dialects | None) -> bool:
+	if dialect:
+		return dialect == Dialects.POSTGRESQL
+	return bool(frappe.db and frappe.db.db_type == "postgres")

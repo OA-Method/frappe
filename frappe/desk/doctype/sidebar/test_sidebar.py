@@ -3,20 +3,38 @@
 
 import json
 from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import frappe
 from frappe.desk.doctype.sidebar.sidebar import (
+	ARRANGED_ITEM_FIELDS,
 	COMPUTED_BASE_CACHE_KEY,
 	MODULE_CONTENT_DOCTYPES,
+	PRIVATE_HEADER_ICON,
+	ROUTABLE_ENTITY_KINDS,
 	SYSTEM_WRITE_FLAGS,
+	UNROUTABLE_IN_A_TITLE,
+	ShellIndex,
+	build_canonical_shells,
 	clear_computed_base_cache,
 	filter_sidebar_items,
+	get_app_sidebar_layer,
 	get_computed_base,
+	get_module_shell,
 	get_sidebar,
+	home_shell,
 	item_key,
 	mark_as_standard,
+	reset_app_sidebar,
+	resolve_sidebar,
+	routable_entities,
+	routable_title,
+	save_app_sidebar,
+	shell_slug,
 	unmark_as_standard,
 )
+from frappe.desk.doctype.workspace.workspace import PRIVATE_MODULE, ensure_module
 from frappe.tests import IntegrationTestCase
 
 MODULE = "Test Sidebar Module"
@@ -504,8 +522,11 @@ class TestSidebarIsNamedByItsTitle(IntegrationTestCase):
 		"""
 		make_sidebar(self.MODULE, title=self.LEADS)
 
+		# postgres aborts the transaction on a failed statement, so recover to a savepoint
+		frappe.db.savepoint("duplicate_title")
 		with self.assertRaises(frappe.DuplicateEntryError):
 			make_sidebar(self.MODULE, title=self.LEADS)
+		frappe.db.rollback(save_point="duplicate_title")
 
 	def test_the_title_index_catches_a_row_whose_name_has_drifted(self):
 		"""What `unique` on `title` buys over the primary key, which already forbids two records of
@@ -519,8 +540,10 @@ class TestSidebarIsNamedByItsTitle(IntegrationTestCase):
 		drifted = make_sidebar(self.MODULE)
 		frappe.db.set_value("Sidebar", drifted.name, "title", self.LEADS, update_modified=False)
 
+		frappe.db.savepoint("drifted_title")
 		with self.assertRaises(frappe.UniqueValidationError):
 			make_sidebar(self.MODULE, title=self.LEADS)
+		frappe.db.rollback(save_point="drifted_title")
 
 	def test_module_is_neither_required_nor_unique(self):
 		module = frappe.get_meta("Sidebar").get_field("module")
@@ -607,6 +630,25 @@ class TestSidebarIsNamedByItsTitle(IntegrationTestCase):
 
 		self.assertEqual(frappe.get_doc("Dock", layer.name).items[0].link_to, self.RENAMED)
 
+	def test_deleting_the_sidebar_drops_the_dock_rows_naming_it(self):
+		"""`Dock Item.link_to` is a Dynamic Link, which no delete checks, so without `on_trash` the
+		row would stay behind pointing at a sidebar that is gone."""
+		doc = make_sidebar(self.MODULE)
+		frappe.db.delete("Dock", {"app": "frappe", "user": "test@example.com"})
+		layer = frappe.get_doc(
+			{
+				"doctype": "Dock",
+				"app": "frappe",
+				"user": "test@example.com",
+				"items": [{"link_type": "Sidebar", "link_to": self.MODULE}],
+			}
+		).insert(ignore_permissions=True)
+		self.addCleanup(frappe.delete_doc, "Dock", layer.name, force=True, ignore_permissions=True)
+
+		frappe.delete_doc("Sidebar", doc.name, force=True, ignore_permissions=True)
+
+		self.assertEqual(frappe.get_doc("Dock", layer.name).items, [])
+
 	def test_deleting_the_module_deletes_every_sidebar_it_owns(self):
 		"""Deleting by name reached exactly one, which was every one of them while a module
 		could only have one."""
@@ -635,6 +677,570 @@ class TestSidebarIsNamedByItsTitle(IntegrationTestCase):
 			frappe.get_doc("Sidebar", "Build").exported_file_path(),
 			os.path.join(frappe.get_module_path("Build"), "sidebar", "build", "build.json"),
 		)
+
+
+class TestSidebarTitleIsRoutable(IntegrationTestCase):
+	"""A sidebar's name is a segment of the desk URL, so it has to survive being one.
+
+	`/desk/stock/item` names the Stock shell and the Item list. The name reaches the URL through
+	`frappe.router.slug`, which only lowercases and turns spaces into dashes, so anything else in
+	the title lands in the path as it was written.
+
+	The rule is only about characters a path cannot carry. It says nothing about the module: a
+	module may still own several sidebars, and the second one is a shell with a URL of its own.
+	"""
+
+	MODULE = "Test Sidebar Routing Module"
+	SECOND = "Test Sidebar Second Shell"
+
+	def setUp(self):
+		with no_developer_mode():
+			frappe.get_doc(
+				{"doctype": "Module Def", "module_name": self.MODULE, "app_name": "frappe"}
+			).insert()
+
+	def tearDown(self):
+		for name in frappe.get_all("Sidebar", filters={"module": self.MODULE}, pluck="name"):
+			frappe.delete_doc("Sidebar", name, force=True, ignore_permissions=True)
+		with no_developer_mode():
+			frappe.delete_doc("Module Def", self.MODULE, force=True, ignore_missing=True)
+
+	def test_a_title_the_url_cannot_carry_is_refused(self):
+		"""One case per character, because each breaks the path differently: `/` ends the segment,
+		`?` and `#` end the path, `%` opens an escape, and `\\` is a separator to some servers.
+		"""
+		for title in ("Pay/Benefits", "Why?", "100% Club", "A#B", "C\\D"):
+			with self.subTest(title=title):
+				# postgres aborts the transaction on a failed statement, so recover to a savepoint
+				frappe.db.savepoint("unroutable_title")
+				with self.assertRaises(frappe.ValidationError):
+					make_sidebar(self.MODULE, title=title)
+				frappe.db.rollback(save_point="unroutable_title")
+
+	def test_an_ampersand_is_allowed_because_the_slug_spells_it_out(self):
+		"""hrms named two shells with an `&` on purpose, since a module folder is a Python package
+		and cannot hold one. `&` is legal in a path, so the name stands and the slug is what
+		turns it into `shift-and-attendance`.
+		"""
+		self.assertEqual(make_sidebar(self.MODULE, title="Shift & Attendance").name, "Shift & Attendance")
+
+	def test_a_title_in_another_script_is_allowed(self):
+		"""Non-ASCII percent-encodes, round-trips, and a browser shows it as it was written.
+		Refusing it would say a shell can only be named in English.
+		"""
+		self.assertEqual(make_sidebar(self.MODULE, title="कर्मचारी").name, "कर्मचारी")
+
+	def test_a_second_shell_under_one_module_keeps_its_own_name(self):
+		"""The rule is about the URL, not the module.
+
+		This is here to catch a tightening that would tie the title back to its module. That would
+		read as tidier, and it would delete the second shell, since two sidebars cannot share a
+		title. A second shell now has a URL of its own, which is the reason to keep it.
+		"""
+		own = make_sidebar(self.MODULE)
+		second = make_sidebar(self.MODULE, title=self.SECOND)
+
+		self.assertEqual(second.module, own.module)
+		self.assertEqual(own.name, self.MODULE)
+		self.assertEqual(second.name, self.SECOND)
+
+	def test_a_title_that_slugs_like_another_shell_is_refused(self):
+		"""The desk keys shells by slug, and the second one written wins. Two titles that differ
+		only in case, the spelling of `&` or their spacing reach it as one segment, and one of
+		them would have no URL at all.
+		"""
+		make_sidebar(self.MODULE, title="Pay & Benefits")
+
+		for title in ("Pay and Benefits", "pay & benefits", "Pay  &  Benefits"):
+			with self.subTest(title=title):
+				frappe.db.savepoint("colliding_title")
+				with self.assertRaises(frappe.ValidationError):
+					make_sidebar(self.MODULE, title=title)
+				frappe.db.rollback(save_point="colliding_title")
+
+	def test_a_title_that_slugs_like_a_bare_module_is_refused(self):
+		"""A module with no sidebar document still gets a computed shell under its own name, and
+		that name is a segment too.
+
+		Spelled with `&` against a module spelled with `and`, so the titles are different strings
+		and `validate_title_is_its_own` -- which refuses another module's exact name -- has
+		nothing to say. Only the slug catches it.
+		"""
+		bare = "Test Sidebar Bare and Module"
+		with no_developer_mode():
+			frappe.get_doc({"doctype": "Module Def", "module_name": bare, "app_name": "frappe"}).insert()
+		self.addCleanup(self.drop_module, bare)
+
+		with self.assertRaises(frappe.ValidationError):
+			make_sidebar(self.MODULE, title="Test Sidebar Bare & Module")
+
+	def test_a_sidebar_may_slug_like_its_own_module(self):
+		"""hrms titles the sidebar of module `Shift and Attendance` as `Shift & Attendance`. Both
+		slug to one segment, and that is fine: a module whose sidebar has a document gets no
+		computed shell of its own, so only one of the two is ever a shell.
+		"""
+		title = self.MODULE.replace(" ", " & ", 1)
+		module = self.MODULE.replace(" ", " and ", 1)
+		with no_developer_mode():
+			frappe.get_doc({"doctype": "Module Def", "module_name": module, "app_name": "frappe"}).insert()
+		self.addCleanup(self.drop_module, module)
+
+		self.assertEqual(make_sidebar(module, title=title).name, title)
+
+	def test_a_sidebar_may_take_its_own_module_name_in_other_case(self):
+		"""Module Def names compare without case in the database, so a title that differs from its
+		own module only in case still finds that module.
+		"""
+		title = self.MODULE.upper()
+		self.assertEqual(make_sidebar(self.MODULE, title=title).name, title)
+
+	def test_renaming_a_sidebar_to_its_own_slug_is_allowed(self):
+		"""Changing only the case or the spacing of a title leaves its segment where it was, and
+		it must not collide with itself.
+		"""
+		doc = make_sidebar(self.MODULE, title=self.SECOND)
+		doc.title = self.SECOND.lower()
+		with developer_mode():
+			doc.save(ignore_permissions=True)
+
+	def test_an_old_title_is_repaired_rather_than_refused(self):
+		"""What the v16 conversion does with a title from before the rule. The characters a path
+		cannot carry become spaces, so the author's words survive, and a title that still takes
+		another shell's URL falls back to the module.
+		"""
+		self.assertEqual(routable_title("Pay/Benefits", self.MODULE), "Pay Benefits")
+		self.assertEqual(routable_title("100% Club?", self.MODULE), "100 Club")
+
+		make_sidebar(self.MODULE, title="Taken Title")
+		self.assertEqual(routable_title("Taken/Title", self.MODULE), self.MODULE)
+
+	def test_an_old_title_is_numbered_when_the_module_name_is_taken_too(self):
+		"""Another module's sidebar can already answer to this module's slug, as `Shift and
+		Attendance` does for a module `Shift & Attendance`. Handing back the module's name then
+		would only have `insert` refuse it and abort the migrate, so it is numbered instead.
+		"""
+		taken = {shell_slug("Taken Title"), shell_slug(self.MODULE)}
+		with patch(
+			"frappe.desk.doctype.sidebar.sidebar.shell_holding_slug",
+			side_effect=lambda title, **kwargs: "Other" if shell_slug(title) in taken else None,
+		):
+			self.assertEqual(routable_title("Taken/Title", self.MODULE), f"{self.MODULE} 2")
+
+			taken.add(shell_slug(f"{self.MODULE} 2"))
+			self.assertEqual(routable_title("Taken/Title", self.MODULE), f"{self.MODULE} 3")
+
+	@staticmethod
+	def drop_module(module):
+		for name in frappe.get_all("Sidebar", filters={"module": module}, pluck="name"):
+			frappe.delete_doc("Sidebar", name, force=True, ignore_permissions=True)
+		with no_developer_mode():
+			frappe.delete_doc("Module Def", module, force=True, ignore_missing=True)
+
+	def test_the_sidebars_frappe_ships_all_survive_a_url(self):
+		for name in frappe.get_all("Sidebar", filters={"standard": 1, "app": "frappe"}, pluck="name"):
+			with self.subTest(name=name):
+				self.assertEqual([c for c in UNROUTABLE_IN_A_TITLE if c in name], [])
+
+
+def shell_payload(spec: dict) -> dict:
+	"""A `bootinfo.module_sidebars` payload from a compact spelling, for the ladder's tests.
+
+	Each shell is given as `{"module": ..., "workspaces": [...], "lists": [(kind, entity), ...]}`,
+	where a Page entry may add the item's `route` as a third element. Everything the ladder does not
+	read is left out. Building the payload by hand rather than from documents is what lets one test
+	say one thing: the ladder's order is the subject, and real sidebars would drag permissions,
+	customizations and computed bases into it.
+	"""
+	return {
+		shell: {
+			"module": shell_spec.get("module", shell),
+			"workspaces": shell_spec.get("workspaces", []),
+			"computed": shell_spec.get("computed", 0),
+			"items": [
+				{"link_type": kind, "link_to": entity, "route": route}
+				for kind, entity, route in ((*listed, None)[:3] for listed in shell_spec.get("lists", []))
+			],
+		}
+		for shell, shell_spec in spec.items()
+	}
+
+
+class TestCanonicalShell(IntegrationTestCase):
+	"""Where an entity opens when nothing else states a shell.
+
+	This is the desk's resolution ladder minus its two per-browser inputs, so what is left can be
+	worked out on the server and reads the same on every device. The tests below are the ladder's
+	steps, one each, in the order they run.
+	"""
+
+	def test_the_entitys_own_module_answers_when_its_shell_lists_it(self):
+		index = shell_payload({"Stock": {"lists": [("DocType", "Item")]}, "Selling": {}})
+
+		self.assertEqual(ShellIndex(index).resolve("DocType", "Item", "Stock"), "Stock")
+
+	def test_a_shell_listing_the_entity_beats_a_module_that_does_not(self):
+		"""The step that must not be dropped.
+
+		It reads as redundant beside the last one, since a module usually has a shell of its own,
+		and removing it moved a hundred entities on an erpnext and hrms site. `Appraisal` is the
+		shape of it: its module is `HR`, `HR` has a shell, and hrms split its navigation out so
+		`Performance` is what lists it. Without this step every such entity lands back in the
+		module the split exists to empty.
+		"""
+		index = shell_payload({"HR": {}, "Performance": {"lists": [("DocType", "Appraisal")]}})
+
+		self.assertEqual(ShellIndex(index).resolve("DocType", "Appraisal", "HR"), "Performance")
+
+	def test_a_computed_sidebar_keeps_its_module_s_entities_anyway(self):
+		"""Not listing something only says something when someone chose what the sidebar lists.
+
+		A computed sidebar lists what its module holds, capped at a display limit, so an entity
+		missing from one was not left out. Reading that as a decision hands the entity to whichever
+		other shell happens to link it. This is the case for every module a customer adds, since
+		nobody shipped a sidebar for it, and a site whose apps all ship one has no computed shells
+		at all -- which is why leaving this out looks harmless.
+		"""
+		index = shell_payload(
+			{
+				"Widgets": {"computed": 1},
+				"Selling": {"lists": [("DocType", "Widget")]},
+			}
+		)
+
+		self.assertEqual(ShellIndex(index).resolve("DocType", "Widget", "Widgets"), "Widgets")
+
+	def test_a_shipped_sidebar_that_omits_the_entity_gives_it_away(self):
+		"""The other half. An app wrote this sidebar and left the entity out, so that is a
+		decision, and a shell that does list it wins.
+		"""
+		index = shell_payload(
+			{
+				"Widgets": {"computed": 0},
+				"Selling": {"lists": [("DocType", "Widget")]},
+			}
+		)
+
+		self.assertEqual(ShellIndex(index).resolve("DocType", "Widget", "Widgets"), "Selling")
+
+	def test_a_row_in_the_private_shell_claims_nothing(self):
+		"""A user who keeps a shortcut to `Job Offer` in their own shell has not moved it there.
+		`Private` sorts ahead of `Recruitment`, so counted as a claim it would win.
+		"""
+		index = shell_payload(
+			{
+				"HR": {},
+				"Private": {"lists": [("DocType", "Job Offer")]},
+				"Recruitment": {"lists": [("DocType", "Job Offer")]},
+			}
+		)
+
+		self.assertEqual(ShellIndex(index).resolve("DocType", "Job Offer", "HR"), "Recruitment")
+
+	def test_the_module_answers_last_when_no_shell_lists_the_entity(self):
+		index = shell_payload({"Stock": {}, "Selling": {"lists": [("DocType", "Customer")]}})
+
+		self.assertEqual(ShellIndex(index).resolve("DocType", "Warehouse", "Stock"), "Stock")
+
+	def test_an_heir_that_lists_the_entity_answers_for_a_code_only_module(self):
+		"""`Core` ships no navigation and declares where it went. The heir that lists the entity
+		wins over the first heir declared, which is how `User` reaches `Users` rather than
+		`System`.
+		"""
+		index = shell_payload({"System": {}, "Build": {}, "Users": {"lists": [("DocType", "User")]}})
+
+		self.assertEqual(ShellIndex(index).resolve("DocType", "User", "Core"), "Users")
+
+	def test_the_first_heir_takes_what_none_of_them_lists(self):
+		"""`Core`'s heirs are declared `System, Build, Data, Users, Email`, and `System` leads on
+		purpose: it is the internals shell, so an unplaced `Core` doctype lands there rather than
+		turning the developer-tooling sidebar into the dumping ground.
+		"""
+		index = shell_payload({"Build": {}, "System": {}, "Users": {}})
+
+		self.assertEqual(ShellIndex(index).resolve("DocType", "Tag Link", "Core"), "System")
+
+	def test_a_module_with_no_shell_and_no_heirs_answers_nothing(self):
+		index = shell_payload({"Stock": {}})
+
+		self.assertIsNone(ShellIndex(index).resolve("DocType", "Widget", "Some Vanished Module"))
+
+	def test_a_renamed_shell_still_answers_for_its_module(self):
+		"""A sidebar's name and its module are two different things, so the module is found
+		through the column the shell stores it in, not by assuming the two agree.
+		"""
+		index = shell_payload(
+			{"Quality": {"module": "Quality Management", "lists": [("DocType", "Quality Goal")]}}
+		)
+
+		self.assertEqual(
+			ShellIndex(index).resolve("DocType", "Quality Goal", "Quality Management"), "Quality"
+		)
+
+	def test_a_name_shared_across_kinds_resolves_apart(self):
+		"""Entity names are not unique across kinds. On an erpnext and hrms site `Attendance` is
+		both a DocType in `HR` and a Dashboard in `Shift & Attendance`, and `Project`, `Selling`
+		and `Stock` each name both a Dashboard and a doctype. A flat map answers one of each pair
+		wrong, whichever order it was built in.
+		"""
+		index = ShellIndex(
+			shell_payload(
+				{
+					"HR": {"lists": [("DocType", "Attendance")]},
+					"Shift & Attendance": {"lists": [("Dashboard", "Attendance")]},
+				}
+			)
+		)
+
+		self.assertEqual(index.resolve("DocType", "Attendance", "HR"), "HR")
+		self.assertEqual(index.resolve("Dashboard", "Attendance", "HR"), "Shift & Attendance")
+
+	def test_a_workspace_belongs_to_the_shell_that_lists_it(self):
+		"""Workspaces skip the ladder. Which shell a workspace belongs to is stored on the shell,
+		so there is nothing to resolve.
+		"""
+		index = ShellIndex(shell_payload({"Stock": {"workspaces": ["Stock", "Warehousing"]}}))
+
+		self.assertEqual(dict(index.workspace_owners()), {"Stock": "Stock", "Warehousing": "Stock"})
+
+
+class TestCanonicalShellOfAPageRoute(IntegrationTestCase):
+	"""Several apps link one container page with a route of their own: Selling links
+	`insights-dashboard` at `selling`, Pulse at `pulse-health`. The page belongs to Insights, so
+	keyed by the page alone every such route opened in Insights.
+	"""
+
+	PAGE = "insights-dashboard"
+	SIDEBARS = shell_payload(
+		{
+			"Insights": {"lists": [("Page", PAGE)]},
+			"Selling": {"lists": [("Page", PAGE, "selling")]},
+			"Pulse": {"lists": [("Page", PAGE, "pulse-health")]},
+		}
+	)
+
+	def build(self, entity_module=None):
+		perm_ctx = SimpleNamespace(
+			can_read=[],
+			allowed_reports={},
+			allowed_pages={self.PAGE: {"module": "Insights"}},
+			get_allowed_dashboards=lambda cache: [],
+		)
+		canonical, _home = build_canonical_shells(self.SIDEBARS, entity_module or {}, perm_ctx)
+		return canonical["Page"]
+
+	def test_a_page_route_opens_in_the_shell_that_lists_it(self):
+		pages = self.build()
+
+		self.assertEqual(pages[f"{self.PAGE}/selling"], "Selling")
+		self.assertEqual(pages[f"{self.PAGE}/pulse-health"], "Pulse")
+
+	def test_the_page_itself_still_opens_in_its_module(self):
+		self.assertEqual(self.build()[self.PAGE], "Insights")
+
+	def test_an_item_with_a_route_still_lists_its_page(self):
+		self.assertEqual(
+			ShellIndex(self.SIDEBARS).listed_in("Page", self.PAGE), ["Insights", "Selling", "Pulse"]
+		)
+
+	def test_a_page_route_can_be_claimed(self):
+		from frappe.boot import build_entity_module_map
+
+		sidebars = shell_payload({"Insights": {}, "Pulse": {}})
+		sidebars["Pulse"]["items"] = [
+			{"link_type": "Page", "link_to": self.PAGE, "route": "pulse-health", "is_default_module": 1}
+		]
+
+		self.assertEqual(build_entity_module_map(sidebars)[f"{self.PAGE}/pulse-health"], "Pulse")
+
+
+class TestCanonicalShellOfASystemOrSharedPage(IntegrationTestCase):
+	"""A system page opens in no shell and a shared page in any. Only the first changes the map:
+	a shared page still has to open somewhere when nothing states a shell.
+	"""
+
+	SIDEBARS = shell_payload({"Build": {"lists": [("Page", "desktop", "apps")]}, "Printing": {}})
+
+	def build(self):
+		perm_ctx = SimpleNamespace(
+			can_read=[],
+			allowed_reports={},
+			allowed_pages={
+				"desktop": {"module": "Build", "system_page": 1},
+				"print": {"module": "Printing", "shared_page": 1},
+			},
+			get_allowed_dashboards=lambda cache: [],
+		)
+		canonical, _home = build_canonical_shells(self.SIDEBARS, {}, perm_ctx)
+		return canonical["Page"]
+
+	def test_a_system_page_is_not_in_the_map(self):
+		self.assertNotIn("desktop", self.build())
+
+	def test_a_route_into_a_system_page_is_not_in_the_map_either(self):
+		self.assertNotIn("desktop/apps", self.build())
+
+	def test_a_shared_page_opens_in_its_module_when_nothing_states_a_shell(self):
+		self.assertEqual(self.build()["print"], "Printing")
+
+	def test_the_desk_is_told_which_pages_are_which(self):
+		from frappe.desk.desk_views import DeskViews
+
+		email = user_with_roles("test-sidebar-page-flags@example.com", ["Desk User"])
+		self.enterContext(self.set_user(email))
+		pages = DeskViews.get_allowed_pages()
+
+		self.assertEqual(pages["print"].get("shared_page"), 1)
+		self.assertNotIn("system_page", pages["print"])
+		self.assertEqual(pages["desktop"].get("system_page"), 1)
+		self.assertNotIn("shared_page", pages["desktop"])
+
+
+class TestCanonicalShellPayload(IntegrationTestCase):
+	"""The whole map, against the site as it stands."""
+
+	@staticmethod
+	def build(with_home=False):
+		from frappe.boot import build_entity_module_map, get_module_sidebars
+		from frappe.desk.desk_views import DeskViews
+
+		desk_views = DeskViews()
+		desk_views.build_entities()
+		sidebars = get_module_sidebars()
+		canonical, home = build_canonical_shells(sidebars, build_entity_module_map(sidebars), desk_views)
+		if with_home:
+			return canonical, home, routable_entities(desk_views)
+		return canonical
+
+	def assert_total(self):
+		"""Everything the user can reach is in the map. Compared against what they can reach
+		rather than read off the map itself, because the map leaves out what it could not place,
+		so checking its own values for a missing shell finds nothing by construction.
+		"""
+		canonical, home, reachable = self.build(with_home=True)
+
+		self.assertTrue(reachable["DocType"], "the user can read nothing, so this test proves nothing")
+		for kind, entities in reachable.items():
+			self.assertEqual(sorted(set(entities) - set(canonical[kind])), [], kind)
+		return canonical, home
+
+	def test_every_doctype_the_user_can_read_lands_somewhere(self):
+		"""The ladder has to be total. A doctype with no shell has no prefix to put in its URL,
+		so it would be the one route shaped differently from every other.
+		"""
+		self.assert_total()
+
+	def test_a_user_with_most_modules_blocked_still_lands_everywhere(self):
+		"""The case the map used to miss. Administrator sees every module, so every step of the
+		ladder has a shell to answer with, and the map was complete for the user it was built
+		and tested as. A user who may see one module can still read doctypes from all the others,
+		and before the last two steps those opened with no sidebar. On erpnext.site it was 135
+		of 151 doctypes for a Selling-only user.
+		"""
+		from frappe.boot import get_module_sidebars
+
+		frappe.set_user("Administrator")
+		kept = next(iter(get_module_sidebars()))
+		blocked = [m for m in frappe.get_all("Module Def", pluck="name") if m != kept]
+		email = user_with_roles("test-sidebar-one-module@example.com", ["System Manager"])
+		user = frappe.get_doc("User", email)
+		user.set("block_modules", [{"module": module} for module in blocked])
+		user.save(ignore_permissions=True)
+		self.enterContext(self.set_user(email))
+
+		shells = set(get_module_sidebars())
+		canonical, home = self.assert_total()
+
+		self.assertIn(home, shells)
+		named = {shell for found in canonical.values() for shell in found.values()}
+		self.assertEqual(named - shells, set())
+
+	def test_workspaces_are_not_in_the_shipped_map(self):
+		"""The desk answers a workspace from `module_sidebars[shell].workspaces`, which it already
+		has. A second copy in the map is payload nothing reads, and two copies of one fact can
+		disagree. `home_shell` still needs the answer, and gets it without shipping it.
+		"""
+		self.assertEqual(sorted(self.build()), sorted(ROUTABLE_ENTITY_KINDS))
+		self.assertNotIn("Workspace", self.build())
+
+	def test_every_shell_named_is_one_the_user_can_see(self):
+		"""The map is built from an already-filtered payload, so it can only name a shell this
+		user has. A name outside it would be a shell the desk cannot render.
+		"""
+		from frappe.boot import get_module_sidebars
+
+		shells = set(get_module_sidebars())
+		named = {shell for found in self.build().values() for shell in found.values()}
+
+		self.assertEqual(named - shells, set())
+
+	def test_home_is_where_most_of_the_work_is(self):
+		"""Not the shell that sorts first. For a user whose shells are `Custom Workspaces` and
+		`Selling`, the first is a place to keep their own pages, and Selling is where they work.
+		"""
+		sidebars = {"Custom Workspaces": {}, "Selling": {}}
+		canonical = {"DocType": {"Customer": "Selling", "Quotation": "Selling", "Note": "Custom Workspaces"}}
+		workspaces = {"Mine": "Custom Workspaces", "Other": "Custom Workspaces"}
+
+		self.assertEqual(home_shell(sidebars, canonical, workspaces, default_workspace=None), "Selling")
+
+	def test_home_ties_go_to_the_earlier_shell(self):
+		self.assertEqual(home_shell({"A": {}, "B": {}}, {"DocType": {}}, {}), "A")
+
+	def test_home_is_the_shell_of_the_users_default_workspace(self):
+		"""What the user asked for beats where the ladder put the most of their work. The desk
+		used to settle this for itself, off `boot.user.default_workspace`; it reads the answer
+		as `boot.home_shell` now, so this is the only place the choice is honoured.
+		"""
+		sidebars = {"Custom Workspaces": {}, "Selling": {}}
+		canonical = {"DocType": {"Customer": "Selling", "Quotation": "Selling"}}
+
+		self.assertEqual(
+			home_shell(sidebars, canonical, {"Mine": "Custom Workspaces"}, default_workspace="Mine"),
+			"Custom Workspaces",
+		)
+
+	def test_a_default_workspace_the_user_cannot_see_is_ignored(self):
+		"""A workspace absent from the map is one this user cannot reach, so landing them on it
+		would land them on nothing. The count decides instead, as it does for a user who set no
+		default at all.
+		"""
+		sidebars = {"Custom Workspaces": {}, "Selling": {}}
+		canonical = {"DocType": {"Customer": "Selling"}}
+
+		self.assertEqual(home_shell(sidebars, canonical, {}, default_workspace="Gone"), "Selling")
+
+	def test_the_boot_hands_over_the_default_it_already_loaded(self):
+		"""`get_user` reads the default workspace before `load_desktop_data` runs, and the boot
+		passes that value on rather than reading it again. Checked through the boot itself,
+		because the wiring between the two is the part that can break.
+
+		The workspace is picked from a shell the count would not choose, so the answer can only
+		come from the default.
+		"""
+		from frappe.boot import load_desktop_data
+
+		without = frappe._dict(user=frappe._dict(default_workspace=None))
+		load_desktop_data(without)
+
+		# Read through the same index the boot uses, since a workspace two shells list belongs to
+		# the first of them and not to whichever this loop happens to meet.
+		owners = ShellIndex(without.module_sidebars).workspace_owners()
+		elsewhere = next(((ws, shell) for ws, shell in owners if shell != without.home_shell), None)
+		if not elsewhere:
+			self.skipTest("every workspace on this site sits in the home shell")
+
+		workspace, shell = elsewhere
+		chosen = frappe._dict(user=frappe._dict(default_workspace={"name": workspace}))
+		load_desktop_data(chosen)
+
+		self.assertEqual(chosen.home_shell, shell)
+
+	def test_child_tables_are_absent(self):
+		"""A child table is never routed to, so carrying one would only make the payload bigger."""
+		canonical = self.build()
+		tables = frappe.get_all("DocType", filters={"istable": 1}, pluck="name", limit=200)
+
+		self.assertEqual([name for name in tables if name in canonical["DocType"]], [])
 
 
 class TestSidebarStandard(IntegrationTestCase):
@@ -920,6 +1526,27 @@ class TestSidebarStandard(IntegrationTestCase):
 
 			self.assertFalse(frappe.db.exists("Sidebar", name))
 			self.assertFalse(os.path.exists(path))
+
+	def test_un_marking_takes_the_document_it_is_given(self):
+		"""A module may own more than one sidebar and this deletes one, so it names the document.
+
+		Told only the module it would have to pick, and the form's button is pressed on a sidebar
+		the user is looking at: picking would take a different one away and leave that one on
+		screen.
+
+		"""
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			self.with_content()
+			own = mark_as_standard(MODULE)
+			other = make_sidebar(MODULE, title="Test Sidebar Second")
+			other.standard = 1
+			other.app = "frappe"
+			other.save(ignore_permissions=True)
+
+			unmark_as_standard(other.name)
+
+			self.assertFalse(frappe.db.exists("Sidebar", other.name))
+			self.assertTrue(frappe.db.exists("Sidebar", own), "the other sidebar is untouched")
 
 	def test_un_marking_returns_the_module_to_its_computed_base(self):
 		"""In the same request. The document going away is not the module losing its navigation, since
@@ -1613,3 +2240,589 @@ class TestComputedSidebarBase(IntegrationTestCase):
 				frappe.cache.hget(COMPUTED_BASE_CACHE_KEY, self.module),
 				f"{doctype}.clear_cache() does not bust the computed sidebar base",
 			)
+
+
+class TestAppSidebarLayer(IntegrationTestCase):
+	"""The editor's third layer, which is the `Sidebar` document itself.
+
+	The two layers above are `Custom Sidebar` documents laid over a base. This one is the base, so
+	arranging it writes the document its app ships and exports the file behind it. A module no app
+	shipped a sidebar for starts from the one computed from its contents, which is what the desk
+	is already drawing, so the first save turns what is on screen into a fixture.
+
+	Everything here is developer mode only, which is the gate `validate_app_content` already puts
+	on writing a `Sidebar` by any other route.
+
+	"""
+
+	def setUp(self):
+		frappe.set_user("Administrator")
+		if not frappe.db.exists("Module Def", MODULE):
+			with no_developer_mode():
+				frappe.get_doc(
+					{"doctype": "Module Def", "module_name": MODULE, "app_name": "frappe"}
+				).insert()
+		self.clear_module_content()
+		clear_computed_base_cache(MODULE)
+		self.addCleanup(clear_computed_base_cache, MODULE)
+
+	def tearDown(self):
+		frappe.set_user("Administrator")
+		self.clear_module_content()
+		with no_developer_mode():
+			frappe.delete_doc("Module Def", MODULE, force=True, ignore_missing=True)
+		# `remove_orphan_entities` commits, so anything written before it is already durable and
+		# the framework's rollback will not undo it. See `TestSidebarStandard.tearDown`.
+		frappe.db.commit()  # nosemgrep
+
+	def clear_module_content(self):
+		for name in frappe.get_all("Sidebar", filters={"module": MODULE}, pluck="name"):
+			frappe.delete_doc("Sidebar", name, force=True, ignore_permissions=True)
+		for name in frappe.get_all("Custom Sidebar", filters={"module": MODULE}, pluck="name"):
+			frappe.delete_doc("Custom Sidebar", name, force=True, ignore_permissions=True)
+		frappe.db.delete("Report", {"module": MODULE})
+
+	def with_content(self):
+		"""Two reports, so the module's computed base has an order worth rearranging."""
+		make_report(MODULE, "Test App Layer Report A")
+		make_report(MODULE, "Test App Layer Report B")
+		clear_computed_base_cache(MODULE)
+
+	def rendered(self):
+		"""The module's sidebar as the desk draws it, which is where hiding has to show up."""
+		from frappe.desk.doctype.sidebar.sidebar import resolve_sidebar
+
+		clear_computed_base_cache(MODULE)
+		resolved = resolve_sidebar(MODULE, "Administrator")
+		return [item["label"] for item in resolved.items] if resolved else []
+
+	def test_a_module_with_no_document_reads_its_computed_base(self):
+		"""The starting point is what the desk already shows.
+
+		Nothing persists a base, so the ordinary state of a module is to have no document, and the
+		editor has to open on the sidebar generated from the module's contents rather than on an
+		empty list to fill in by hand.
+
+		"""
+		with developer_mode():
+			self.with_content()
+			self.assertFalse(frappe.db.exists("Sidebar", MODULE))
+
+			self.assertEqual(
+				[row["key"] for row in get_app_sidebar_layer(MODULE)],
+				[item_key(row) for row in get_computed_base(MODULE).rows],
+			)
+
+	def test_every_row_reads_as_the_item_rather_than_a_reference_to_one(self):
+		"""`added` says a row brings its own item to a layer above a base. This is the base, so
+		nothing here adds anything to anything, and the editor has to treat every row as one it may
+		hide rather than one it may delete."""
+		with developer_mode():
+			self.with_content()
+
+			self.assertTrue(all(row["added"] == 0 for row in get_app_sidebar_layer(MODULE)))
+
+	def test_saving_writes_a_standard_document_and_exports_it(self):
+		"""One action. The layer is named after the app, and a document that is not standard is not
+		the app's: no file backs it and no migrate re-imports it."""
+		import os
+
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			self.with_content()
+			rows = get_app_sidebar_layer(MODULE)
+
+			save_app_sidebar(MODULE, rows)
+
+			doc = frappe.get_doc("Sidebar", MODULE)
+			self.assertEqual(doc.standard, 1)
+			self.assertEqual(doc.app, "frappe")
+			self.assertTrue(os.path.exists(doc.exported_file_path()))
+			self.assertEqual([item_key(row) for row in doc.items], [row["key"] for row in rows])
+
+	def test_saving_stores_the_order_on_screen(self):
+		"""The whole arrangement is written, not a delta, so the order the editor was left in is
+		the order the document ends up holding."""
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			self.with_content()
+			rows = get_app_sidebar_layer(MODULE)
+			reversed_rows = list(reversed(rows))
+
+			save_app_sidebar(MODULE, reversed_rows)
+
+			self.assertEqual(
+				[item_key(row) for row in frappe.get_doc("Sidebar", MODULE).items],
+				[row["key"] for row in reversed_rows],
+			)
+
+	def test_a_hidden_row_is_kept_and_stops_rendering(self):
+		"""Hiding is how an entry leaves an app's sidebar, and the row stays so it can come back.
+
+		This is the half that used not to work: a base row's `hidden` was neither read from the
+		table nor carried into the merge, so an app could ship one and it would render anyway.
+
+		"""
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			self.with_content()
+			rows = get_app_sidebar_layer(MODULE)
+			target = next(row for row in rows if row["link_to"] == "Test App Layer Report A")
+			self.assertIn(target["label"], self.rendered())
+
+			target["hidden"] = 1
+			save_app_sidebar(MODULE, rows)
+
+			stored = {item_key(row): row.hidden for row in frappe.get_doc("Sidebar", MODULE).items}
+			self.assertEqual(stored[target["key"]], 1, "the row was dropped instead of hidden")
+			self.assertNotIn(target["label"], self.rendered())
+
+	def test_a_row_left_out_is_deleted_from_the_document_and_the_file(self):
+		"""Removing an entry is not the same as hiding it, and this layer is the only one where
+		the difference can be had.
+
+		Its arrangement is the base, so a row left out of it is gone: out of the document's table
+		and out of the file the save exports, with nothing underneath for it to fall back to. On
+		the two layers above, a row left out means "no opinion" and the base shows through, which
+		is why hiding is the only way to take something off up there.
+
+		"""
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			self.with_content()
+			rows = get_app_sidebar_layer(MODULE)
+			dropped = next(row for row in rows if row["link_to"] == "Test App Layer Report A")
+
+			save_app_sidebar(MODULE, [row for row in rows if row["key"] != dropped["key"]])
+
+			doc = frappe.get_doc("Sidebar", MODULE)
+			self.assertNotIn(dropped["key"], [item_key(row) for row in doc.items])
+
+			with open(doc.exported_file_path()) as f:
+				exported = json.load(f)
+			self.assertNotIn(dropped["link_to"], [item.get("link_to") for item in exported["items"]])
+
+			self.assertNotIn(dropped["label"], self.rendered())
+
+	def test_a_hidden_row_can_be_brought_back(self):
+		"""Which is the reason for keeping it. A row that was deleted could only be re-added from
+		the pool; one that was hidden is still in the arrangement to un-hide."""
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			self.with_content()
+			rows = get_app_sidebar_layer(MODULE)
+			target = next(row for row in rows if row["link_to"] == "Test App Layer Report A")
+			target["hidden"] = 1
+			save_app_sidebar(MODULE, rows)
+
+			back = get_app_sidebar_layer(MODULE)
+			hidden_again = next(row for row in back if row["key"] == target["key"])
+			self.assertEqual(hidden_again["hidden"], 1, "the editor cannot see what it hid")
+
+			hidden_again["hidden"] = 0
+			save_app_sidebar(MODULE, back)
+
+			self.assertIn(target["label"], self.rendered())
+
+	def test_a_section_keeps_the_shape_it_was_given(self):
+		"""What the editor's pencil decides about a section: whether it draws as a heading over a
+		divider or as an indented row with its entries nested under it, and how it folds.
+
+		They are columns like any other, so they survive on the same terms as the rest. This pins
+		them because they are the ones the editor offers, and a section whose shape did not
+		survive a save would be the one thing the editor cannot work around.
+
+		"""
+		shape = {"indent": 1, "collapsible": 0, "show_arrow": 1, "keep_closed": 1}
+
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			self.with_content()
+			rows = get_app_sidebar_layer(MODULE)
+			section = next(row for row in rows if row["type"] == "Section Break")
+			section.update(shape)
+
+			save_app_sidebar(MODULE, rows)
+
+			# The key is a hash of the row's type and label, neither of which the shape touches,
+			# so the section is still the one that was changed.
+			back = next(row for row in get_app_sidebar_layer(MODULE) if row["key"] == section["key"])
+			self.assertEqual({field: back[field] for field in shape}, shape)
+
+	def test_the_editor_round_trips_every_column(self):
+		"""A save rebuilds the table from what the client sent rather than merging into what was
+		stored, so a column the editor does not carry is a column the next save drops.
+
+		This is the only thing that says so. It fails when a column is added to `Sidebar Item`
+		and not to `ARRANGED_ITEM_FIELDS`, which is a change nothing else would notice until
+		someone arranged a sidebar and lost the value.
+
+		"""
+		layout = {"Section Break", "Column Break", "HTML", "Tab Break", "Heading"}
+		columns = {
+			field.fieldname
+			for field in frappe.get_meta("Sidebar Item").fields
+			if field.fieldtype not in layout
+		}
+		# `navigate_to_tab`, `hidden` and `added` are set by `app_item` itself; `key` is cleared
+		# by `clear_stored_keys`, for the reason it gives.
+		handled = set(ARRANGED_ITEM_FIELDS) | {"navigate_to_tab", "hidden", "added", "key"}
+
+		self.assertEqual(columns - handled, set())
+
+	def test_resetting_removes_the_document_and_its_file(self):
+		"""The layer below this one is the computed base, which is worked out on read, so the
+		module has a working sidebar again in the same request."""
+		import os
+
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			self.with_content()
+			save_app_sidebar(MODULE, get_app_sidebar_layer(MODULE))
+			path = frappe.get_doc("Sidebar", MODULE).exported_file_path()
+
+			reset_app_sidebar(MODULE)
+
+			self.assertFalse(frappe.db.exists("Sidebar", MODULE))
+			self.assertFalse(os.path.exists(path))
+			self.assertTrue(self.rendered())
+
+	def test_resetting_reaches_a_sidebar_that_was_renamed(self):
+		"""The document the save wrote is the document the reset has to remove.
+
+		A sidebar is named by its title, so a module's shell need not carry the module's name, and
+		the read and the save both address it however it is named. A reset that asked the naming
+		rule instead would find nothing under the module's name and report success, leaving the
+		document on the site and its file in the app.
+
+		"""
+		import os
+
+		renamed = "Test App Layer Sidebar Renamed"
+
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			self.with_content()
+			save_app_sidebar(MODULE, get_app_sidebar_layer(MODULE))
+			doc = frappe.get_doc("Sidebar", MODULE)
+			doc.title = renamed
+			doc.save(ignore_permissions=True)
+			path = frappe.get_doc("Sidebar", renamed).exported_file_path()
+			self.assertTrue(os.path.exists(path), "sanity: the rename moved the file")
+
+			reset_app_sidebar(MODULE)
+
+			self.assertFalse(frappe.db.exists("Sidebar", renamed))
+			self.assertFalse(os.path.exists(path))
+			self.assertTrue(self.rendered(), "the module falls back to its computed base")
+
+	def test_the_editor_stays_on_the_sidebar_that_was_on_screen(self):
+		"""A module may own more than one sidebar, and the module alone does not say which of them
+		the person had open, so all three calls carry the shell.
+
+		Without it they take whichever sidebar comes first by name. They agree with each other, so
+		nothing looks broken: the editor reads that one, the save writes it and the reset deletes
+		it. They agree on a document nobody was looking at, though, so the rows on screen are not
+		the sidebar the desk is drawing, and the reset takes away the wrong one.
+
+		"""
+		import os
+
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			deals = make_sidebar(MODULE, title="Test App Layer Deals")
+			leads = make_sidebar(MODULE, title="Test App Layer Leads")
+			for doc, label in ((deals, "Deals Home"), (leads, "Leads Home")):
+				doc.items[0].label = label
+				doc.save(ignore_permissions=True)
+
+			self.assertEqual(
+				get_module_shell(MODULE).name, deals.name, "sanity: the module alone lands elsewhere"
+			)
+
+			rows = get_app_sidebar_layer(MODULE, shell=leads.name)
+			self.assertEqual([row["label"] for row in rows], ["Leads Home"])
+
+			save_app_sidebar(MODULE, rows, shell=leads.name)
+			self.assertTrue(frappe.db.get_value("Sidebar", leads.name, "standard"))
+			self.assertFalse(
+				frappe.db.get_value("Sidebar", deals.name, "standard"), "the other one is untouched"
+			)
+
+			path = frappe.get_doc("Sidebar", leads.name).exported_file_path()
+			reset_app_sidebar(MODULE, shell=leads.name)
+
+			self.assertFalse(frappe.db.exists("Sidebar", leads.name))
+			self.assertFalse(os.path.exists(path))
+			self.assertTrue(frappe.db.exists("Sidebar", deals.name), "the other one survives")
+
+	def test_a_shell_the_module_no_longer_owns_is_refused(self):
+		"""An editor left open while that sidebar was renamed is holding a name nothing answers to.
+
+		It is not asking for the fallback. Taking it would arrange, save over or delete whichever
+		sidebar comes first by name, which is another shell under the same module and not the one
+		anybody had open, and reset makes that unrecoverable: the document goes and its exported
+		directory is removed from the app.
+
+		"""
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			deals = make_sidebar(MODULE, title="Test App Layer Deals")
+			leads = make_sidebar(MODULE, title="Test App Layer Leads")
+			was = leads.name
+			leads.title = "Test App Layer Prospects"
+			leads.save(ignore_permissions=True)
+
+			for call in (
+				lambda: get_app_sidebar_layer(MODULE, shell=was),
+				lambda: save_app_sidebar(MODULE, [], shell=was),
+				lambda: reset_app_sidebar(MODULE, shell=was),
+			):
+				with self.assertRaises(frappe.ValidationError):
+					call()
+
+			self.assertTrue(frappe.db.exists("Sidebar", deals.name), "the other one is still there")
+
+	def test_the_module_s_own_name_is_not_a_way_past_the_check(self):
+		"""The module's name passes because a computed base has no document to check against. A
+		module that does have one, named after itself, is a different case: renaming it leaves the
+		editor holding the module's name with nothing behind it, and letting that through lands on
+		whichever sidebar comes first by name.
+		"""
+		with module_resolvable_on_disk(MODULE), developer_mode():
+			other = make_sidebar(MODULE, title="Test App Layer Alpha")
+			own = make_sidebar(MODULE)
+			own.title = "Test App Layer Zebra"
+			own.save(ignore_permissions=True)
+
+			with self.assertRaises(frappe.ValidationError):
+				reset_app_sidebar(MODULE, shell=MODULE)
+
+			self.assertTrue(frappe.db.exists("Sidebar", other.name), "the other one is still there")
+
+	def test_a_shell_under_another_module_is_ignored(self):
+		"""The shell says which of a module's sidebars, and the module still says which module. The
+		resolver carries the module into its lookup, so a name belonging elsewhere selects nothing
+		and no caller reaches out of the module it named. Refusing such a name, rather than falling
+		back, is `check_shell`'s job at the endpoints.
+		"""
+		with developer_mode():
+			own = make_sidebar(MODULE)
+
+			self.assertEqual(get_module_shell(MODULE, "Build").name, own.name)
+
+	def test_none_of_it_works_without_developer_mode(self):
+		"""`standard` means a file inside an app, and only a developer's site writes those. The
+		editor hides the layer, and each endpoint refuses as well, because the layer being absent
+		from a screen is not what stops a call."""
+		with developer_mode():
+			self.with_content()
+			rows = get_app_sidebar_layer(MODULE)
+
+		with no_developer_mode():
+			for call in (
+				lambda: get_app_sidebar_layer(MODULE),
+				lambda: save_app_sidebar(MODULE, rows),
+				lambda: reset_app_sidebar(MODULE),
+			):
+				with self.assertRaises(frappe.ValidationError):
+					call()
+
+
+class TestPageItemRoute(IntegrationTestCase):
+	"""`Sidebar Item.route` is the path inside the page an item opens."""
+
+	PAGE = "permission-manager"
+
+	def setUp(self):
+		if not frappe.db.exists("Module Def", MODULE):
+			with no_developer_mode():
+				frappe.get_doc(
+					{"doctype": "Module Def", "module_name": MODULE, "app_name": "frappe"}
+				).insert()
+
+	def tearDown(self):
+		for name in frappe.get_all("Sidebar", filters={"module": MODULE}, pluck="name"):
+			frappe.delete_doc("Sidebar", name, force=True, ignore_permissions=True)
+		with no_developer_mode():
+			frappe.delete_doc("Module Def", MODULE, force=True, ignore_missing=True)
+
+	def sidebar_with(self, *items, **item):
+		doc = frappe.new_doc("Sidebar")
+		doc.module = MODULE
+		for row in items or (item,):
+			doc.append("items", {"type": "Link", "label": "Dashboard", **row})
+		with developer_mode():
+			return doc.insert(ignore_permissions=True)
+
+	def test_the_boot_payload_carries_the_route(self):
+		"""The desk picks the sidebar for a route from this payload."""
+		self.sidebar_with(link_type="Page", link_to=self.PAGE, route="payroll")
+
+		items = filter_sidebar_items(frappe.get_doc("Sidebar", MODULE).items, None, check_permission=False)
+
+		self.assertEqual(items[0]["route"], "payroll")
+
+	def test_a_route_is_stored_without_surrounding_whitespace(self):
+		"""A stray space would break the link and split one destination into two identities."""
+		doc = self.sidebar_with(link_type="Page", link_to=self.PAGE, route=" payroll ")
+
+		self.assertEqual(frappe.get_doc("Sidebar", doc.name).items[0].route, "payroll")
+
+	def test_a_route_that_leaves_the_page_is_refused(self):
+		for route in ("/payroll", "../payroll", "payroll/../../todo", "https://example.com"):
+			with self.subTest(route=route), self.assertRaises(frappe.ValidationError):
+				self.sidebar_with(link_type="Page", link_to=self.PAGE, route=route)
+
+	def test_a_query_or_a_fragment_is_not_a_route(self):
+		for route in ("payroll?dashboard=1", "payroll#top"):
+			with self.subTest(route=route), self.assertRaises(frappe.ValidationError):
+				self.sidebar_with(link_type="Page", link_to=self.PAGE, route=route)
+
+	def test_only_a_page_item_has_a_route_inside_it(self):
+		with self.assertRaises(frappe.ValidationError):
+			self.sidebar_with(link_type="DocType", link_to="User", route="payroll")
+
+	def test_a_page_item_needs_no_route(self):
+		doc = self.sidebar_with(link_type="Page", link_to=self.PAGE)
+
+		self.assertFalse(frappe.get_doc("Sidebar", doc.name).items[0].route)
+
+	def test_an_item_with_no_route_keeps_the_key_it_always_had(self):
+		"""`Custom Sidebar` rows on customer sites name items by this string."""
+		self.assertEqual(
+			item_key({"type": "Link", "link_type": "Page", "link_to": self.PAGE}),
+			"Link|Page|permission-manager||",
+		)
+
+	def test_both_routes_survive_the_filter_that_drops_duplicates(self):
+		self.sidebar_with(
+			{"link_type": "Page", "link_to": self.PAGE, "route": "accounts"},
+			{"link_type": "Page", "link_to": self.PAGE, "route": "payments"},
+		)
+
+		items = filter_sidebar_items(frappe.get_doc("Sidebar", MODULE).items, None, check_permission=False)
+
+		self.assertEqual([item["route"] for item in items], ["accounts", "payments"])
+
+
+class TestPrivateShell(IntegrationTestCase):
+	"""The `Private` shell is one user's own pages, and nothing else.
+
+	Every other shell is a module: the same items for everyone who can see it, arranged by the app,
+	then the site, then the user. This one is a person. Its contents are the pages the viewer made,
+	whatever module each was filed under, so two people standing on `/desk/private` see two
+	different sidebars and neither can arrange the other's.
+	"""
+
+	def setUp(self):
+		frappe.set_user("Administrator")
+		ensure_module(PRIVATE_MODULE)
+		self.user = user_with_roles("test-private-shell@example.com", ["System Manager"])
+		self.addCleanup(frappe.set_user, "Administrator")
+
+	def make_page(self, title, module=PRIVATE_MODULE, for_user=None, public=0):
+		for_user = self.user if for_user is None and not public else for_user
+		doc = frappe.get_doc(
+			{
+				"doctype": "Workspace",
+				"title": title,
+				"label": f"{title}-{for_user}" if for_user else title,
+				"module": module,
+				"public": public,
+				"for_user": for_user or "",
+				"content": "[]",
+			}
+		).insert(ignore_permissions=True)
+		self.addCleanup(frappe.delete_doc, "Workspace", doc.name, force=True, ignore_missing=True)
+		# Registered after the delete, so it runs before it: cleanups are undone last-first, and a
+		# test that switched user cannot delete a page it does not own.
+		self.addCleanup(frappe.set_user, "Administrator")
+		return doc
+
+	def shell(self, user=None):
+		"""The shell as that user sees it.
+
+		The session is switched, not just the argument: the pages a resolution adds come from
+		`get_workspaces`, which answers for whoever is logged in.
+		"""
+		user = user or self.user
+		frappe.set_user(user)
+		frappe.clear_cache(user=user)
+		return resolve_sidebar(PRIVATE_MODULE, user)
+
+	def links(self, user=None):
+		return [item["link_to"] for item in self.shell(user).items]
+
+	def test_it_holds_the_pages_this_user_made(self):
+		page = self.make_page("Test Private Shell Page")
+
+		self.assertEqual(self.links(), [page.name])
+
+	def test_a_page_filed_under_another_module_is_in_it_too(self):
+		"""A module says where else a page appears. It cannot say whether the page is in the shell
+		of the person who made it, which is the one place every private page is."""
+		elsewhere = self.make_page("Test Private Shell Elsewhere", module="Users")
+
+		self.assertIn(elsewhere.name, self.links())
+
+	def test_somebody_elses_page_is_not(self):
+		mine = self.make_page("Test Private Shell Mine")
+		theirs = self.make_page("Test Private Shell Theirs", for_user="Administrator")
+
+		self.assertEqual(self.links(), [mine.name])
+
+		# Containment, not equality: Administrator's own shell holds whatever else this bench has
+		# left them. What this asserts is which of the two pages each person sees.
+		theirs_links = self.links("Administrator")
+		self.assertIn(theirs.name, theirs_links)
+		self.assertNotIn(mine.name, theirs_links)
+
+	def test_a_shared_page_in_the_private_module_stays_out(self):
+		"""One saved before the rule below existed. It renders per viewer here, so a page everybody
+		can see has no audience in it."""
+		shared = frappe.get_doc(
+			{
+				"doctype": "Workspace",
+				"title": "Test Private Shell Shared",
+				"label": "Test Private Shell Shared",
+				"module": PRIVATE_MODULE,
+				"public": 1,
+				"content": "[]",
+			}
+		)
+		shared.flags.ignore_validate = True
+		shared.insert(ignore_permissions=True)
+		self.addCleanup(frappe.delete_doc, "Workspace", shared.name, force=True, ignore_missing=True)
+		self.addCleanup(frappe.set_user, "Administrator")
+
+		self.assertNotIn(shared.name, self.links())
+
+	def test_saving_a_shared_page_in_the_private_module_is_refused(self):
+		with self.assertRaises(frappe.ValidationError):
+			frappe.get_doc(
+				{
+					"doctype": "Workspace",
+					"title": "Test Private Shell Refused",
+					"label": "Test Private Shell Refused",
+					"module": PRIVATE_MODULE,
+					"public": 1,
+					"content": "[]",
+				}
+			).insert(ignore_permissions=True)
+
+	def test_it_is_marked_with_a_person(self):
+		"""Every other shell is marked with what its module holds. This one holds one person's
+		pages, so it says so."""
+		self.make_page("Test Private Shell Icon Page")
+
+		self.assertEqual(self.shell().header_icon, PRIVATE_HEADER_ICON)
+
+	def test_it_survives_with_nothing_in_it(self):
+		"""Every other shell disappears when nothing in it is navigable. This one is reached from
+		the user menu, so it has to be there before there is anything in it."""
+		resolved = self.shell()
+
+		self.assertIsNotNone(resolved)
+		self.assertEqual(resolved.items, [])
+
+	def test_a_blocked_module_does_not_hide_your_own_page(self):
+		"""Blocking a module hides a product's navigation. A page you made yourself is not that,
+		and it used to disappear from your own shell with no way to get it back."""
+		page = self.make_page("Test Private Shell Blocked", module="Users")
+		user = frappe.get_doc("User", self.user)
+		user.append("block_modules", {"module": "Users"})
+		user.save(ignore_permissions=True)
+		frappe.clear_cache(user=self.user)
+
+		self.assertIn(page.name, self.links())

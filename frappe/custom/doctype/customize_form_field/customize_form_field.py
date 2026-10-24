@@ -81,6 +81,7 @@ class CustomizeFormField(Document):
 		hide_days: DF.Check
 		hide_seconds: DF.Check
 		ignore_user_permissions: DF.Check
+		ignore_versioning: DF.Check
 		ignore_xss_filter: DF.Check
 		in_filter: DF.Check
 		in_global_search: DF.Check
@@ -94,6 +95,7 @@ class CustomizeFormField(Document):
 		label: DF.Data | None
 		length: DF.Int
 		link_filters: DF.JSON | None
+		make_attachment_public: DF.Check
 		mandatory_depends_on: DF.Code | None
 		mask: DF.Check
 		max_value: DF.Float

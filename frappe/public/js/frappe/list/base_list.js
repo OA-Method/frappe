@@ -1,3 +1,5 @@
+import { safe_href } from "../ui/components/utils.js";
+
 frappe.provide("frappe.views");
 
 frappe.views.BaseList = class BaseList {
@@ -57,7 +59,7 @@ frappe.views.BaseList = class BaseList {
 		this.fields = [];
 		this.filters = [];
 		this.sort_by = this.meta.sort_field || "creation";
-		this.sort_order = this.meta.sort_order || "desc";
+		this.sort_order = (this.meta.sort_order || "desc").toLowerCase();
 
 		// Setup buttons
 		this.primary_action = null;
@@ -130,18 +132,22 @@ frappe.views.BaseList = class BaseList {
 		}
 
 		if (!this.fields) this.fields = [];
+		if (!this.is_queryable_field(fieldname, doctype)) {
+			return;
+		}
+
+		this.fields.push([fieldname, doctype]);
+	}
+
+	is_queryable_field(fieldname, doctype) {
 		const is_valid_field =
 			frappe.model.std_fields_list.includes(fieldname) ||
 			frappe.meta.has_field(doctype, fieldname) ||
 			fieldname === "_seen";
 
-		let is_virtual = this.meta.fields.find((df) => df.fieldname == fieldname)?.is_virtual;
+		const is_virtual = frappe.meta.get_docfield(doctype, fieldname)?.is_virtual;
 
-		if (!is_valid_field || is_virtual) {
-			return;
-		}
-
-		this.fields.push([fieldname, doctype]);
+		return is_valid_field && !is_virtual;
 	}
 
 	set_stats() {
@@ -184,7 +190,10 @@ frappe.views.BaseList = class BaseList {
 	}
 
 	set_title() {
-		this.page.set_title(this.page_title, null, true, "", this.meta?.description);
+		// the title is the last crumb, which set_breadcrumbs() has already written; this only
+		// names the browser tab, so the two cannot disagree about what the page is called
+		this.page.title = this.page_title;
+		frappe.utils.set_title(this.page_title);
 		this.set_deprecated_badge();
 	}
 
@@ -204,38 +213,14 @@ frappe.views.BaseList = class BaseList {
 
 	setup_view_menu() {
 		if (frappe.boot.desk_settings.view_switcher && !this.meta.force_re_route_to_default_view) {
-			const icon_map = {
-				Image: "image",
-				List: "list",
-				Report: "sheet",
-				Calendar: "calendar",
-				Gantt: "square-chart-gantt",
-				Kanban: "square-kanban",
-				Dashboard: "layout-dashboard",
-				Map: "map",
-			};
-
-			const label_map = {
-				List: __("List View"),
-				Report: __("Report View"),
-				Dashboard: __("Dashboard View"),
-				Gantt: __("Gantt View"),
-				Kanban: __("Kanban View"),
-				Calendar: __("Calendar View"),
-				Image: __("Image View"),
-				Inbox: __("Inbox View"),
-				Tree: __("Tree View"),
-				Map: __("Map View"),
-			};
-
 			// one nested dropdown: view rows + the current view's variants
 			// (saved layouts, kanban boards, ...) as its submenu
 			this.views_list = new frappe.views.ListViewSelect({
 				doctype: this.doctype,
 				page: this.page,
 				list_view: this,
-				icon_map: icon_map,
-				label_map: label_map,
+				icon_map: frappe.views.view_icon_map,
+				label_map: frappe.views.get_view_label_map(),
 			});
 		}
 	}
@@ -282,10 +267,27 @@ frappe.views.BaseList = class BaseList {
 					$item && $item.addClass(item.class);
 				}
 			});
+
+		// the DocType's docs, also linked from the list's empty state
+		const docs = safe_href(this.meta?.documentation, "list");
+		if (docs) {
+			this.page.add_dropdown_item({
+				label: __("Documentation"),
+				click: () => window.open(docs, "_blank"),
+				standard: true,
+				parent: this.page.menu,
+				icon_right: "external-link",
+			});
+		}
 	}
 
 	set_breadcrumbs() {
-		frappe.breadcrumbs.add(this.meta.module, this.doctype);
+		this.page.set_breadcrumbs(this.get_breadcrumbs());
+	}
+
+	/** The list is the page, so its one crumb is the title and carries no link. */
+	get_breadcrumbs() {
+		return [{ label: this.page_title, title: this.meta?.description }];
 	}
 
 	hide_sidebar() {
@@ -544,9 +546,11 @@ frappe.views.BaseList = class BaseList {
 			return Promise.resolve();
 		}
 		this.freeze(true);
-		// fetch data from server
+		// a newer refresh (a filter change during a scroll load) owns start and page_length
+		// now, so an older response must not be rendered over it
+		const refresh_id = (this.refresh_id = (this.refresh_id || 0) + 1);
 		return frappe.call(args).then((r) => {
-			// render
+			if (refresh_id !== this.refresh_id) return;
 			this.prepare_data(r);
 			this.toggle_result_area();
 			this.before_render();
@@ -1446,6 +1450,33 @@ class FilterArea {
 		);
 	}
 }
+
+// view identity shared by every switcher on a doctype page header — the
+// list-family views and the tree view all build their switcher from these
+frappe.views.view_icon_map = {
+	Image: "image",
+	List: "list",
+	Report: "sheet",
+	Calendar: "calendar",
+	Gantt: "square-chart-gantt",
+	Kanban: "square-kanban",
+	Dashboard: "layout-dashboard",
+	Map: "map",
+	Tree: "list-tree",
+};
+
+frappe.views.get_view_label_map = () => ({
+	List: __("List View"),
+	Report: __("Report View"),
+	Dashboard: __("Dashboard View"),
+	Gantt: __("Gantt View"),
+	Kanban: __("Kanban View"),
+	Calendar: __("Calendar View"),
+	Image: __("Image View"),
+	Inbox: __("Inbox View"),
+	Tree: __("Tree View"),
+	Map: __("Map View"),
+});
 
 // utility function to validate view modes
 frappe.views.view_modes = [

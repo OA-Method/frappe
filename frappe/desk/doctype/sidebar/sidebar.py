@@ -29,18 +29,21 @@ fetched once into a `SidebarContext` and the per-module work is plain Python ove
 
 import hashlib
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import cached_property
+from itertools import chain, count
 
 import frappe
 from frappe import _
 from frappe.app_state import get_disabled_modules
 from frappe.desk.desk_views import DeskViews
+from frappe.desk.doctype.workspace.workspace import PRIVATE_MODULE
 from frappe.desk.utils import is_item_allowed
 from frappe.model.document import Document
 from frappe.model.rename_doc import rename_doc
-from frappe.utils.modules import get_module_placement
+from frappe.utils.modules import get_code_only_module_heirs, get_module_placement
 
 # The fields copied unchanged from a source item row into a `Sidebar Item`.
 SIDEBAR_ITEM_FIELDS = (
@@ -81,7 +84,10 @@ SIDEBAR_ITEM_FIELDS = (
 # identity would break the very delta that set it -- `narrow_reference` stores label and icon as
 # overrides for exactly that reason, and stores no filters, which is what makes filters stable
 # enough to identify by.
-LINKED_IDENTITY_FIELDS = ("type", "link_type", "link_to", "url", "filters")
+#
+# `route` tells apart two items linking one page, as `filters` does for one doctype. It is last
+# because `item_key` appends it only when set, which keeps every older key unchanged.
+LINKED_IDENTITY_FIELDS = ("type", "link_type", "link_to", "url", "filters", "route")
 
 # Flags that mean the system is installing app content, not that a user is editing.
 #
@@ -89,6 +95,74 @@ LINKED_IDENTITY_FIELDS = ("type", "link_type", "link_to", "url", "filters")
 # has to keep working when developer mode is off, or installing or updating an app that ships a
 # sidebar would fail on every customer site.
 SYSTEM_WRITE_FLAGS = ("in_import", "in_fixtures", "in_migrate", "in_install", "in_patch")
+
+# What a sidebar's title may not contain, because the title is the name, the name is the shell
+# identity, and a shell identity is a segment of the desk URL. See validate_title_is_routable.
+UNROUTABLE_IN_A_TITLE = "/?#%\\"
+
+
+def shell_slug(name: str) -> str:
+	"""The URL segment a shell is reached by. Mirror of `frappe.router.shell_slug`.
+
+	Kept in step with the client by hand, because the two answer different halves of one rule:
+	the desk turns a name into a segment when it writes a URL, and this refuses two names that
+	would write the same one. An `&` is spelled out rather than encoded, since `%26` is not
+	something anyone types or reads.
+
+	It is deliberately not reversible. A segment is turned back into a shell by looking it up in
+	a map (`setup_shell_routes`), never by transforming it, so all that is asked of it is that
+	two shells do not collide on one slug -- which is what `validate_title_has_its_own_url`
+	enforces.
+	"""
+	return re.sub(r"\s+", "-", name.lower().replace("&", " and ").strip())
+
+
+def unroutable_characters(title: str | None) -> list[str]:
+	"""The characters in `title` that a URL segment cannot carry. See `validate_title_is_routable`."""
+	return sorted({character for character in UNROUTABLE_IN_A_TITLE if character in (title or "")})
+
+
+def shell_holding_slug(title: str, *, name: str | None = None, module: str | None = None) -> str | None:
+	"""The shell already reached by the URL segment `title` would take, or `None` when it is free.
+
+	`name` and `module` are the asking sidebar's own. Its current name is left out because a
+	sidebar does not collide with itself, and its module because a module whose sidebar has a
+	document gets no computed shell of its own (see `get_sidebar_bases`), so the two never both
+	hold a segment. That is how hrms titles module `Shift and Attendance` `Shift & Attendance`.
+
+	Every other shell counts, including a module with no document, since that one is a computed
+	shell under its own name. Two reads of small tables, so it belongs on save and in a patch,
+	not in a loop.
+	"""
+	slug = shell_slug(title)
+	taken = [other for other in frappe.get_all("Sidebar", pluck="name") if other != name]
+	taken += [other for other in frappe.get_all("Module Def", pluck="name") if other != module]
+	return next((other for other in taken if shell_slug(other) == slug), None)
+
+
+def routable_title(title: str | None, module: str, name: str | None = None) -> str:
+	"""The nearest title to `title` that can be a shell's URL.
+
+	For titles written before the URL rule existed, which is a v16 sidebar being converted.
+	Refusing one would abort a migrate over a label, so it is repaired instead.
+
+	The characters a path cannot carry become spaces, which keeps the words the author chose:
+	`Pay/Benefits` becomes `Pay Benefits`. If that still takes another shell's URL, the module's
+	own name is next, since that is the default title and usually free.
+
+	Usually, not always: another module's sidebar may already answer to the module's slug, as
+	`Shift and Attendance` does for a module `Shift & Attendance`. Then the module's name is
+	numbered, `Shift & Attendance 2`, since handing back a taken title would only have `insert`
+	refuse it and abort the migrate anyway.
+	"""
+	cleaned = " ".join(re.sub(f"[{re.escape(UNROUTABLE_IN_A_TITLE)}]", " ", title or "").split())
+	base = " ".join(re.sub(f"[{re.escape(UNROUTABLE_IN_A_TITLE)}]", " ", module).split())
+	candidates = chain((cleaned, base), (f"{base} {n}" for n in count(2)))
+	return next(
+		candidate
+		for candidate in candidates
+		if candidate and not shell_holding_slug(candidate, name=name, module=module)
+	)
 
 
 class Sidebar(Document, DeskViews):
@@ -120,7 +194,10 @@ class Sidebar(Document, DeskViews):
 		self.validate_app_content()
 		self.set_default_title()
 		self.validate_title_is_its_own()
+		self.validate_title_is_routable()
+		self.validate_title_has_its_own_url()
 		self.validate_standard()
+		self.validate_item_routes()
 		self.clear_stored_keys()
 
 	def before_save(self):
@@ -149,16 +226,77 @@ class Sidebar(Document, DeskViews):
 
 		Titling a sidebar after its own module is the default and is allowed.
 		"""
-		if self.title == self.module:
-			return
-
-		if frappe.db.exists("Module Def", self.title, cache=True):
+		other = frappe.db.get_value("Module Def", self.title, cache=True)
+		if other and other != self.module:
 			frappe.throw(
 				_("{0} is another module's name, and a sidebar's title is what the desk calls it by.").format(
 					frappe.bold(self.title)
 				),
 				title=_("Pick another title"),
 			)
+
+	def validate_title_is_routable(self):
+		"""Refuse a title that cannot be half of a desk URL.
+
+		A sidebar's name is its shell identity, and a shell identity is a segment of the desk
+		URL: `/desk/stock/item` names the Stock shell and the Item list. `frappe.router.slug`
+		lowercases the name and turns spaces into dashes, and whatever survives that has to read
+		as one path segment.
+
+		Only the characters that break a path segment are refused: `/` ends the segment early,
+		`?` and `#` end the path, `%` opens an escape, and `\\` is read as a separator by some
+		servers. Careful encoding would carry all five, but not every caller encodes -- the
+		sidebar's own item links build a path by concatenation -- so they are refused at the
+		source instead.
+
+		Everything else stays allowed, and `&` deliberately so. hrms named two shells with one
+		because a module folder is a Python package and cannot hold it, and an `&` in a path is
+		legal. Reading `Shift & Attendance` as `shift-and-attendance` is the slug's job, not this
+		one's. Non-ASCII stays allowed too: it percent-encodes, round-trips, and a browser shows
+		it as it was written. A sidebar titled in Hindi is a perfectly good shell.
+
+		This says nothing about the module. A module may own several sidebars, and the one
+		titled after it is the one that answers for it (see `get_sidebar_bases`). A second shell
+		called something else is fine and now has a URL of its own.
+		"""
+		bad = unroutable_characters(self.title)
+		if not bad:
+			return
+
+		frappe.throw(
+			_("A sidebar's name is part of its desk URL, so it cannot contain {0}.").format(
+				frappe.bold(" ".join(bad))
+			),
+			title=_("Pick another title"),
+		)
+
+	def validate_title_has_its_own_url(self):
+		"""Refuse a title that would share its URL segment with another shell.
+
+		`shell_slug` drops what a path cannot carry -- case, the spelling of `&`, runs of
+		whitespace -- so two titles that differ only in those reach the desk as one segment.
+		`Shift & Attendance` and `Shift and Attendance` are both `shift-and-attendance`.
+
+		The desk keeps one map from segment to shell (`setup_shell_routes`), so a collision is
+		not an ambiguity to resolve at read time: the second shell written into the map wins and
+		the first one silently has no URL at all. Refuse it here, while the title can still be
+		changed.
+
+		Every shell is checked, not only the authored ones: see `shell_holding_slug`.
+
+		`validate_title_is_its_own` already refuses a title that *is* another module's name; this
+		is the same rule widened to the names that only look different.
+		"""
+		clash = shell_holding_slug(self.title, name=self.name, module=self.module)
+		if not clash:
+			return
+
+		frappe.throw(
+			_("{0} already answers to the URL {1}, and two shells cannot share one.").format(
+				frappe.bold(clash), frappe.bold(f"/desk/{shell_slug(self.title)}")
+			),
+			title=_("Pick another title"),
+		)
 
 	def rename_to_title(self):
 		"""Rename the document when the title changes, because the name is the title.
@@ -192,6 +330,17 @@ class Sidebar(Document, DeskViews):
 		from frappe.desk.doctype.dock.dock import rename_sidebar_rows
 
 		rename_sidebar_rows(old_name, new_name)
+
+	def on_trash(self):
+		from frappe.desk.doctype.dock.dock import remove_sidebar_rows
+
+		# a dock row is a Dynamic Link, which no delete checks, so it would stay behind pointing at
+		# nothing
+		remove_sidebar_rows(self.name)
+
+	def validate_item_routes(self):
+		for item in self.items:
+			validate_item_route(item)
 
 	def clear_stored_keys(self):
 		"""Blank the `key` column on every item.
@@ -439,8 +588,14 @@ def mark_as_standard(module: str) -> str:
 
 
 @frappe.whitelist()
-def unmark_as_standard(module: str) -> None:
-	"""Give `module`'s sidebar back to the site by deleting its exported file and its document.
+def unmark_as_standard(sidebar: str) -> None:
+	"""Give `sidebar` back to the site by deleting its exported file and its document.
+
+	It names the document rather than the module, because it destroys one and a module may own
+	more than one. `mark_as_standard` takes a module for the opposite reason: there may be no
+	document yet and it has to build one. Both callers have a document to name: the `Sidebar`
+	form's button is pressed on the one on screen, and the app layer's reset names the shell it
+	arranged.
 
 	The document is deleted rather than just unflagged. Once the app content is gone the module
 	falls back to its computed base, which is worked out from the module's contents on read, so
@@ -458,10 +613,13 @@ def unmark_as_standard(module: str) -> None:
 
 	check_developer_mode()
 
-	doc = get_sidebar(module)
+	if not frappe.db.exists("Sidebar", sidebar):
+		return
+
+	doc = frappe.get_doc("Sidebar", sidebar)
 	# Only a standard sidebar belongs to an app. If it is not standard there is nothing to hand
 	# back, and we should not delete a document someone is still working on.
-	if not doc or not doc.standard:
+	if not doc.standard:
 		return
 
 	path = doc.exported_file_path() if doc.is_exported() else None
@@ -497,6 +655,42 @@ def check_developer_mode() -> None:
 	)
 
 
+def check_shell(module: str, shell: str | None) -> None:
+	"""Throw unless `shell` is a sidebar `module` still owns.
+
+	The three app-layer endpoints are told which of a module's sidebars was on screen. One naming
+	a sidebar the module no longer owns is an editor left open while that sidebar was renamed or
+	deleted, and it is not asking for the fallback. Taking the fallback would arrange, save over
+	or delete whichever sidebar comes first by name, which is another shell under the same module
+	and not the one anybody had open; reset makes that unrecoverable, since the exported directory
+	goes with the document.
+
+	Naming no shell is the older client, and a caller holding only a module. Both still get the
+	naming rule.
+
+	The module's own name passes only while the module has no document at all. That is what the
+	client sends for a module whose base is computed, where there is nothing stored to check it
+	against. It stops passing the moment the module owns a sidebar, because then the module's name
+	is either a document this already found or a name someone renamed away from, and the second
+	one is the stale editor this exists to refuse.
+	"""
+	if not shell:
+		return
+
+	if frappe.db.exists("Sidebar", {"name": shell, "module": module}):
+		return
+
+	if shell == module and not frappe.db.exists("Sidebar", {"module": module}):
+		return
+
+	frappe.throw(
+		_("{0} is no longer a sidebar of {1}. Reopen the one you meant to arrange.").format(
+			frappe.bold(shell), frappe.bold(module)
+		),
+		title=_("Sidebar Moved"),
+	)
+
+
 def get_sidebar(module: str) -> "Sidebar | None":
 	"""Return the sidebar that answers for `module`, or `None`.
 
@@ -510,6 +704,40 @@ def get_sidebar(module: str) -> "Sidebar | None":
 	sidebar is named something else.
 	"""
 	name = frappe.db.get_value("Sidebar", {"name": module, "module": module})
+	return frappe.get_doc("Sidebar", name) if name else None
+
+
+def get_module_shell(module: str, shell: str | None = None) -> "Sidebar | None":
+	"""Return the stored sidebar an action on `module` writes to, or `None` when there is none.
+
+	`get_sidebar` answers the naming rule alone, and a module whose sidebar was renamed has no
+	answer there. It still has a sidebar, and that one is what the desk draws and what the editor
+	arranges, so an action that writes an arrangement, or undoes one, has to reach the same
+	document rather than work against a name nothing holds.
+
+	`shell` is what the desk had on screen, and it is the answer whenever it names a sidebar
+	carrying this module. A module may own more than one, and nothing about the module says which
+	of them the person was looking at, so without it a save writes and a reset deletes whichever
+	comes first by name.
+
+	The lookup carries the module, so a shell belonging to another module selects nothing here and
+	no caller can reach out of the module it named. Whether a shell this module does not own is an
+	error rather than a fallback is `check_shell`'s question, asked at the endpoints, because the
+	answer is yes for the three that took the name from a screen and no for callers that never
+	held one.
+
+	The fallback order is `get_module_base`'s, and deliberately the same one: the shell named
+	after the module when there is one, and otherwise the first by name. That is what an older
+	client gets, and what any caller holding only a module gets.
+
+	This asks the table instead of going through `get_module_base`, which computes a base from
+	the module's contents to answer, because the answer here is only ever a document that already
+	exists.
+	"""
+	name = shell and frappe.db.get_value("Sidebar", {"name": shell, "module": module})
+	name = name or frappe.db.get_value("Sidebar", {"name": module, "module": module})
+	name = name or frappe.db.get_value("Sidebar", {"module": module}, order_by="name asc")
+
 	return frappe.get_doc("Sidebar", name) if name else None
 
 
@@ -545,9 +773,231 @@ def materialize_base(module: str) -> "Sidebar":
 	return doc
 
 
+# ---------------------------------------------------------------------------------------
+# The app layer: reading, writing and resetting the sidebar an app ships
+#
+# One editor arranges all three of a sidebar's layers (`frappe.ui.SidebarManager`), so all three
+# answer the same three questions in the same shapes. The two above are `Custom Sidebar`
+# documents and live in `custom_sidebar.py`; this one is the `Sidebar` document itself, so it
+# lives here.
+#
+# Every one of them is developer mode only, which is the gate `validate_app_content` already
+# puts on writing a `Sidebar` by any other route. There is no role check, for the same reason
+# there is none there: a site running in developer mode belongs to a developer.
+# ---------------------------------------------------------------------------------------
+
+# What the editor shows and hands back, under the names the boot payload uses. Each is a
+# `Sidebar Item` column of the same name, except `navigate_to_tab`, which the payload calls
+# `tab` and which is therefore carried on its own.
+#
+# These and the three `app_item` sets itself are every column the child table has, which is what
+# lets a save rebuild the table from what the client sent instead of merging into what was
+# already stored. A column added to `Sidebar Item` and not added here would be dropped by the
+# next save, and `test_the_editor_round_trips_every_column` is the only thing that would say so.
+#
+# Not `SIDEBAR_ITEM_FIELDS`, which answers a different question: what the fixture conversion
+# copies out of a workspace row. That set drops `is_default_module` because a conversion cannot
+# guess an app's claim on an entity; this one keeps it, because a claim the app already made has
+# to survive being arranged.
+ARRANGED_ITEM_FIELDS = (
+	"type",
+	"label",
+	"link_type",
+	"link_to",
+	"icon",
+	"child",
+	"indent",
+	"collapsible",
+	"keep_closed",
+	"url",
+	"show_arrow",
+	"filters",
+	"route",
+	"route_options",
+	"open_in_new_tab",
+	"is_default_module",
+)
+
+
+@frappe.whitelist()
+def get_app_sidebar_layer(module: str, shell: str | None = None) -> list[dict]:
+	"""Return the sidebar `module`'s app ships, as the editor arranges it.
+
+	`shell` is the sidebar the desk had on screen when the editor was opened, and the three calls
+	here take it for the reason `get_module_shell` gives: a module may own more than one, so the
+	module alone does not say which. The two layers in `custom_sidebar.py` take no shell, because
+	a `Custom Sidebar` is anchored to a module and there is one layer per module either way.
+
+	This is a third answer to "what does this module's sidebar look like", beside the two in
+	`custom_sidebar.py`, and it is the bottom one: the base, with no layer over it. A module no
+	app shipped a `Sidebar` for answers with its computed base, which is what the desk draws for
+	it today and what the first save turns into a document.
+
+	Hidden rows are kept, the same as in the layers above, since an editor that cannot see a
+	hidden row cannot offer to bring it back.
+
+	There is no permission filter, the same as the site layer's read and for the same reason:
+	this editor writes the whole arrangement, so a row filtered off the screen would be dropped
+	from the document on the next save.
+	"""
+	from frappe.desk.doctype.custom_sidebar.custom_sidebar import check_module
+
+	check_developer_mode()
+	check_module(module)
+	check_shell(module, shell)
+
+	base = get_module_base(module, shell)
+	# `is_item_allowed` is a method on `DeskViews`, so the filter needs a context object even
+	# when it is not going to check anything with it: one throwaway `Workspace`, the same as
+	# `layer_arrangement` builds.
+	items = filter_sidebar_items(base.rows, frappe.new_doc("Workspace"), check_permission=False)
+
+	# `added` is what a row in a layer above a base says: "I bring my own item". Every row here
+	# is the base, so none of them adds anything to anything, and the editor treats them all as
+	# rows it may hide rather than rows it may delete.
+	return [{**item, "hidden": int(item.get("hidden") or 0), "added": 0} for item in items]
+
+
+@frappe.whitelist()
+def save_app_sidebar(module: str, items: list | str, shell: str | None = None) -> dict:
+	"""Store the arrangement on screen as the sidebar `module`'s app ships, and export it.
+
+	`items` is the whole ordered arrangement rather than a delta, the same as the two saves
+	above. Unlike them, every row is the item itself: this is the base, so there is nothing
+	underneath for a row to refer to.
+
+	The document is made standard here rather than by a later step. The layer is named after the
+	app, and a document that is not standard is not the app's: no file backs it, no migrate
+	re-imports it, and orphan cleanup is not looking for it. A row like that would also replace
+	the computed base on this site while leaving nothing in git to say so. `on_update` writes
+	the file, so the export follows from the flag.
+	"""
+	from frappe.desk.doctype.custom_sidebar.custom_sidebar import check_module, module_payload
+
+	check_developer_mode()
+	check_module(module)
+	check_shell(module, shell)
+
+	if isinstance(items, str):
+		items = json.loads(items)
+
+	doc = app_document(module, shell)
+	doc.set("items", [])
+	for row in items:
+		doc.append("items", app_item(row))
+
+	doc.standard = 1
+	doc.app = get_module_placement(module)
+	doc.save()
+
+	return module_payload()
+
+
+@frappe.whitelist()
+def reset_app_sidebar(module: str, shell: str | None = None) -> dict:
+	"""Drop the sidebar `module`'s app ships, so the module goes back to its computed one.
+
+	The two resets above drop a layer and let the one below show through. This is the bottom
+	layer, and what shows through is the computed base, which is worked out from the module's
+	contents on read and is therefore there again in the same request.
+
+	`unmark_as_standard` does the work: the document and its exported file both go, because a
+	standard row with no file is an orphan and a file with no row comes back on the next migrate.
+	It is named the shell rather than the module, since it deletes what it is given.
+
+	Which shell that is has one answer, `get_module_shell`, shared with the read and the save,
+	and all three are told which one was on screen. The three have to agree: this drops what the
+	person arranged, so resolving it any other way here would delete a document they were not
+	looking at. A module owning nothing to drop, which is the ordinary state of one whose base is
+	computed, is left alone.
+	"""
+	from frappe.desk.doctype.custom_sidebar.custom_sidebar import check_module, module_payload
+
+	check_developer_mode()
+	check_module(module)
+	check_shell(module, shell)
+
+	document = get_module_shell(module, shell)
+	if document:
+		unmark_as_standard(document.name)
+
+	return module_payload()
+
+
+def app_document(module: str, shell: str | None = None) -> "Sidebar":
+	"""Return the document the app layer writes to, materializing it if there is none.
+
+	It addresses the shell the read addressed rather than asking the naming rule, so a module
+	whose sidebar has been renamed is arranged, saved and reset in the same place.
+	`get_sidebar` answers `None` for that module, and `materialize_base` would then build a
+	second sidebar under it instead of writing the one the editor was showing.
+
+	Materializing happens only when the module has no document at all, and a module with none has
+	one shell, the computed one named after it. So there is no shell to carry into
+	`materialize_base`.
+	"""
+	return get_module_shell(module, shell) or materialize_base(module)
+
+
+def app_item(row: dict) -> dict:
+	"""Return one arranged row as a `Sidebar Item` on the app's own document."""
+	item = {field: row.get(field) for field in ARRANGED_ITEM_FIELDS}
+
+	# The payload calls it `tab`. The column does not.
+	item["navigate_to_tab"] = row.get("tab")
+	item["hidden"] = int(bool(row.get("hidden")))
+	# `added` belongs to a row in a layer above a base, where it says the row brings its own
+	# item. A base row is the item, so the flag has nothing to say here. The `key` the editor
+	# sent is dropped by `clear_stored_keys` on save, for the reason it explains.
+	item["added"] = 0
+
+	return item
+
+
 def is_linked(item) -> bool:
 	"""Return whether this row links somewhere. A Section Break or a spacer does not."""
 	return bool(item.get("link_to") or item.get("url"))
+
+
+def linked_entities(item) -> list[str]:
+	"""Return the entities this row links, as the desk names them when picking a shell.
+
+	A Page row with a `route` links the page and the page route it opens, `<page>/<route>`.
+	Several apps link one container page at routes of their own, so the page alone cannot say
+	which shell a route belongs to. Mirrors `linked_entities` in the desk's sidebar.js.
+	"""
+	link_to = item.get("link_to")
+	if not link_to:
+		return []
+	if item.get("link_type") == "Page" and item.get("route"):
+		return [link_to, f"{link_to}/{item['route']}"]
+	return [link_to]
+
+
+def validate_item_route(item) -> None:
+	"""Refuse a `route` that is not a relative path inside a Page. A query belongs in
+	`route_options`."""
+	item.route = (item.get("route") or "").strip() or None
+	route = item.route
+	if not route:
+		return
+
+	if item.get("link_type") != "Page":
+		frappe.throw(
+			_("Only a Page item has a route inside it. {0} links a {1}.").format(
+				frappe.bold(item.get("label") or item.get("link_to")), item.get("link_type")
+			),
+			title=_("Route Not Allowed"),
+		)
+
+	segments = route.split("/")
+	if route.startswith("/") or ":" in segments[0] or ".." in segments or "?" in route or "#" in route:
+		frappe.throw(
+			_("{0} is not a path inside a page. Give a relative path, with no query or fragment.").format(
+				frappe.bold(route)
+			),
+			title=_("Invalid Route"),
+		)
 
 
 def item_key(item) -> str:
@@ -573,7 +1023,9 @@ def item_key(item) -> str:
 	import, which is why a customization can never point at a row's `name`.
 	"""
 	if is_linked(item):
-		return "|".join(item.get(field) or "" for field in LINKED_IDENTITY_FIELDS)
+		*columns, route = (item.get(field) or "" for field in LINKED_IDENTITY_FIELDS)
+		key = "|".join(columns)
+		return f"{key}|{route}" if route else key
 
 	return item.get("key") or unlinked_key(item)
 
@@ -592,11 +1044,13 @@ def unlinked_key(item) -> str:
 # ---------------------------------------------------------------------------------------
 # The merge: folding a module's several old sidebars into one
 #
-# Only data conversion uses this. Both callers are conversions:
+# Only data conversion uses this. Every caller is a conversion:
 #
 #   * `convert_fixtures`, where an app's old fixtures were one file per workspace, so a module
 #     with four workspaces has to end up with one sidebar.
-#   * `patches.v16_0.convert_sidebars`, where a user may have forked several of a module's
+#   * `patches.v16_0.convert_sidebars`, the same for the rows of a site's v16 app sidebars.
+#   * `patches.v16_0.convert_custom_sidebars`, which merges nothing but builds the same shape.
+#   * `patches.v16_0.convert_personal_sidebars`, where a user may have forked several of a module's
 #     sidebars and now needs a single customization layer.
 #
 # Nothing on a running site merges. That is why this sits beside the model rather than inside
@@ -699,6 +1153,34 @@ def merge_items(primary: frappe._dict, secondaries: list[frappe._dict]) -> list[
 	return merged
 
 
+def options_as_filters(row) -> None:
+	"""Store a link's v16 `route_options` as its `filters`, which is what they were.
+
+	`filters` is part of an item's identity, so Stock Balance for one warehouse stays an item
+	apart from Stock Balance itself, rather than being merged into it. A Page or a URL is left
+	alone: its `route_options` is the page's own query, not a filter.
+	"""
+	if row.get("filters") or not row.get("route_options") or row.get("link_type") in ("Page", "URL"):
+		return
+
+	try:
+		options = json.loads(row.route_options)
+	except ValueError:
+		return
+	if not isinstance(options, dict) or not options:
+		return
+
+	row.filters = json.dumps(
+		[
+			[row.link_to, field, *value]
+			if isinstance(value, list) and len(value) == 2
+			else [row.link_to, field, "=", value]
+			for field, value in options.items()
+		]
+	)
+	row.route_options = None
+
+
 def build_sidebar(module: str, workspaces: list[frappe._dict]) -> frappe._dict:
 	"""Return the sidebar this module's workspaces merge into, as a plain dict."""
 	primary = pick_primary(module, workspaces)
@@ -751,6 +1233,11 @@ OVERFLOW_KEY = "_dropped_doctypes"
 
 # The icon a module gets in the dock when it specifies none.
 DEFAULT_HEADER_ICON = "hammer"
+
+# The Private shell's own icon. It is one person's shell rather than a module of things, so it is
+# marked with a person rather than with whatever the `Private` module happens to hold. A layer of
+# the owner's may still replace it.
+PRIVATE_HEADER_ICON = "user"
 
 
 def get_module_contents(modules: list[str]) -> dict[str, dict[str, list]]:
@@ -1146,7 +1633,7 @@ def resolve_sidebar(shell: str, user: str, context: SidebarContext | None = None
 	resolved on its own, through its own module, so a module's other shells come along and the
 	answer matches what a batch would give.
 	"""
-	from frappe.desk.doctype.custom_sidebar.custom_sidebar import merge_layers
+	from frappe.desk.doctype.custom_sidebar.custom_sidebar import merged_arrangement
 
 	if context is None:
 		context = SidebarContext.for_modules([module_of_shell(shell) or shell], user)
@@ -1154,6 +1641,9 @@ def resolve_sidebar(shell: str, user: str, context: SidebarContext | None = None
 		raise ValueError(f"sidebar context is {context.user}'s, and cannot answer for {user}")
 
 	base = context.bases[shell]
+	if base.module == PRIVATE_MODULE:
+		return resolve_private_sidebar(shell, user, context, base)
+
 	filtered = filter_sidebar_items(base.rows, context.perm_ctx)
 
 	# Customizations are applied after the permission filter, never before, so a customization
@@ -1164,20 +1654,34 @@ def resolve_sidebar(shell: str, user: str, context: SidebarContext | None = None
 	# module inherits that. Re-anchoring would change what a customization names, not how a
 	# sidebar resolves.
 	layers = context.layers.get(base.module, [])
+	hidden = set()
 	if layers:
-		filtered = merge_layers(filtered, layers)
+		filtered, hidden = merged_arrangement(filtered, layers)
 		# An added row is the one kind that gets past that check, because it brings an item the
 		# base never held, so the filter above never saw it. Checking it here keeps the rule
 		# true for rows that bring their own item as well as rows that name an existing one.
 		filtered = [item for item in filtered if allowed_added_item(item, context.perm_ctx)]
+	else:
+		# No layer to fold in, but the base may still hide: an app may ship a row off by
+		# default, and a module nobody has customized has to honour that. `merge_layers` gives
+		# the same answer for an empty list of layers, at the cost of copying every item of
+		# every module on every boot to get there.
+		filtered = [item for item in filtered if not item.get("hidden")]
 
-	# The user's private pages are added after that, which keeps them out of every stored
-	# customization: a customization can only name what it was shown when it was saved, and
-	# these arrive later.
-	filtered = append_derived_items(filtered, context.private_rows.get(base.module), context.perm_ctx)
+	# The user's private pages, for the ones no row names yet. A page made since rows were written
+	# has one in this user's own layer and is already above; this is the fallback for every page
+	# made before that, and for a row that stopped applying.
+	#
+	# `hidden` is passed so the fallback cannot undo a decision: a private page the user hid in
+	# this module's sidebar is missing from `filtered` because they hid it, and appending it here
+	# would put it straight back on the next boot.
+	filtered = append_derived_items(
+		filtered, context.private_rows.get(base.module), context.perm_ctx, hidden=hidden
+	)
 
-	# A shell needs at least one item this user can open, or it is dropped. Section Breaks do not
-	# count, since a header links nowhere; private pages and added rows are already in `filtered`.
+	# A shell needs at least one item this user can open, or it is dropped. Section Breaks and
+	# spacers do not count, since they link nowhere; private pages and added rows are already in
+	# `filtered`.
 	#
 	# The lower of two tiers. `User.block_modules` is the upper one, applied upstream in
 	# `get_navigable_modules`; it names modules, so this is a fallback for a module-rooted shell
@@ -1188,7 +1692,7 @@ def resolve_sidebar(shell: str, user: str, context: SidebarContext | None = None
 	# everyone, blank.
 	#
 	# `is_icon_permitted` mirrors this; the two must stay in step.
-	if not any(row.get("type") != "Section Break" for row in filtered):
+	if not any(row.get("type") not in ("Section Break", "Spacer") for row in filtered):
 		return None
 
 	label = base.title or shell
@@ -1225,6 +1729,75 @@ def resolve_sidebar(shell: str, user: str, context: SidebarContext | None = None
 	)
 
 
+def resolve_private_sidebar(
+	shell: str, user: str, context: SidebarContext, base: frappe._dict
+) -> ResolvedSidebar:
+	"""Return the Private shell: the pages this user made, and nothing else.
+
+	It is the one shell whose contents are a person rather than a module, so three of the rules
+	above do not apply to it.
+
+	The base's rows are dropped. They are what the `Private` module holds, and what a module holds
+	is public, so they would put a page everyone can see into a shell that renders per viewer.
+	`Workspace.validate` refuses to save a new one; a site that already had one keeps it, reachable
+	by its own URL and listed nowhere here.
+
+	Only this user's own layer applies. The site's layer would arrange every user's private pages
+	at once, which is not a thing anyone could mean, and a workspace manager curating a module
+	should not be shown rows about other people's pages.
+
+	It is never dropped for being empty. Every other shell disappears when nothing in it is
+	navigable, because an empty sidebar is an unfinished one. This one is reached from the user
+	menu, so it has to exist before there is anything in it, and the desk draws its empty state.
+
+	Pages are pinned here: `hidden` is not passed to the append, so a page left out of the
+	arrangement comes back. A private page can be hidden from a module's sidebar, where it is a
+	guest, and not from this one, which is its home.
+	"""
+	from frappe.desk.doctype.custom_sidebar.custom_sidebar import merged_arrangement
+
+	layers = [layer for layer in context.layers.get(PRIVATE_MODULE, []) if layer.user == user]
+	items = []
+	if layers:
+		items, _hidden = merged_arrangement([], layers)
+		items = [item for item in items if allowed_added_item(item, context.perm_ctx)]
+
+	items = append_derived_items(items, all_private_rows(context.private_rows), context.perm_ctx)
+
+	label = base.title or shell
+	header_icon = PRIVATE_HEADER_ICON
+	for layer in layers:
+		if layer.label:
+			label = layer.label
+		if layer.header_icon:
+			header_icon = layer.header_icon
+
+	return ResolvedSidebar(
+		name=shell,
+		module=base.module,
+		label=_(label),
+		app=base.app or get_module_placement(base.module),
+		header_icon=header_icon,
+		module_onboarding=context.onboardings.get(base.module),
+		customized=bool(layers),
+		computed=bool(base.get("computed")),
+		# Only the pages of this module, so a page belonging to another one is still that module's
+		# workspace. This list is how the desk answers which shell a workspace belongs to, and a
+		# private page's own answer is decided by the route it was reached through instead.
+		workspaces=[row.link_to for row in context.private_rows.get(PRIVATE_MODULE) or []],
+		items=items,
+	)
+
+
+def all_private_rows(private_rows: dict[str, list[frappe._dict]]) -> list[frappe._dict]:
+	"""Every private page the user owns as one list, whatever module each belongs to.
+
+	The Private shell lists all of them. A module only says where else a page appears, so it
+	cannot decide whether a page is in its owner's own shell.
+	"""
+	return [row for rows in private_rows.values() for row in rows]
+
+
 def get_navigable_modules() -> list[str]:
 	"""Return the site's modules, minus the ones this user cannot navigate to.
 
@@ -1251,9 +1824,19 @@ def get_navigable_modules() -> list[str]:
 	# just cannot take you there.
 	disabled = get_disabled_modules()
 	code_only = get_code_only_modules()
-	visible = get_visible_modules(frappe.get_all("Module Def", pluck="name", order_by="name asc"))
+	modules = frappe.get_all("Module Def", pluck="name", order_by="name asc")
+	visible = get_visible_modules(modules)
 
-	return [module for module in visible if module not in disabled and module not in code_only]
+	navigable = [module for module in visible if module not in disabled and module not in code_only]
+
+	# The `Private` module is where a user's own pages live, and the shell it names is reached from
+	# the user menu rather than from a rail. None of the three checks above is about the user's own
+	# pages: blocking a module hides a product's navigation, and a site turning off an app says
+	# nothing about what somebody made for themselves. So it stays, in its place in the order.
+	if PRIVATE_MODULE in modules and PRIVATE_MODULE not in navigable:
+		navigable = sorted([*navigable, PRIVATE_MODULE])
+
+	return navigable
 
 
 def get_sidebar_bases(modules: list[str]) -> dict[str, frappe._dict]:
@@ -1359,13 +1942,17 @@ def module_of_shell(shell: str | None) -> str | None:
 	return frappe.db.get_value("Sidebar", shell, "module", cache=True) or None
 
 
-def get_module_base(module: str) -> frappe._dict:
-	"""Return the base a `Custom Sidebar` layer applies to: the module's own shell.
+def get_module_base(module: str, shell: str | None = None) -> frappe._dict:
+	"""Return the base a layer applies to: the shell named, or the module's own.
 
-	A layer is anchored to a module, not a shell, so the editor that reads and writes one needs
-	a single base however many shells the module owns. The naming rule picks the shell named
-	after the module. If every shell was renamed, the first in order answers, so the editor gets
-	a base instead of a `KeyError`.
+	A `Custom Sidebar` layer is anchored to a module, not a shell, so the editor that reads and
+	writes one needs a single base however many shells the module owns, and those callers name no
+	shell. The naming rule picks the shell named after the module. If every shell was renamed,
+	the first in order answers, so the editor gets a base instead of a `KeyError`.
+
+	The app layer does hold a shell, since it writes the `Sidebar` document itself rather than a
+	layer over it, and naming one here is how its read stays on the sidebar the desk was showing.
+	Only shells under `module` are looked at, so naming another module's shell selects nothing.
 
 	This falls back where `get_sidebar` returns `None`, on purpose. `get_sidebar` answers which
 	sidebar is the module's, and a module whose sidebars are all renamed has no answer. This
@@ -1377,7 +1964,7 @@ def get_module_base(module: str) -> frappe._dict:
 	this function.
 	"""
 	bases = get_sidebar_bases([module])
-	return bases.get(module) or next(iter(bases.values()))
+	return bases.get(shell) or bases.get(module) or next(iter(bases.values()))
 
 
 def sidebar_for_module(payload: dict, module: str) -> dict | None:
@@ -1421,10 +2008,14 @@ def get_sidebar_items(sidebar_names):
 			"url",
 			"show_arrow",
 			"filters",
+			"route",
 			"route_options",
 			"navigate_to_tab",
 			"open_in_new_tab",
 			"is_default_module",
+			# Read so the base can hide, which is what the editor's app layer writes. See
+			# `filter_sidebar_items`, which is where the value reaches the merge.
+			"hidden",
 		],
 		order_by="idx asc",
 	):
@@ -1520,10 +2111,11 @@ def filter_sidebar_items(items, perm_ctx, check_permission: bool = True):
 	Two rows with the same identity are the same item, and a customization cannot say something
 	about one and not the other, so the first wins. That is what the desk drew before.
 
-	`check_permission` is off for one caller only: the editor reading the site layer. Permission
-	is a fact about the user, applied to what each user boots, so it is not part of what the
-	site arranged. A curator whose screen filtered an item out would otherwise drop the site's
-	rows for it on the next save. See `layer_arrangement`.
+	`check_permission` is off for two callers: the editor reading the site layer, and the editor
+	reading the app's own. Permission is a fact about the user, applied to what each user boots,
+	so it is not part of what the site or the app arranged. Either editor writes the whole
+	arrangement, so a screen with an item filtered out of it would drop that item's row on the
+	next save. See `layer_arrangement` and `get_app_sidebar_layer`.
 	"""
 	filtered = []
 	seen = set()
@@ -1538,7 +2130,7 @@ def filter_sidebar_items(items, perm_ctx, check_permission: bool = True):
 		# queries.
 		if (
 			check_permission
-			and item.type != "Section Break"
+			and item.type not in ("Section Break", "Spacer")
 			and not is_item_allowed(item.link_to, item.link_type, perm_ctx)
 		):
 			continue
@@ -1557,31 +2149,58 @@ def filter_sidebar_items(items, perm_ctx, check_permission: bool = True):
 			"url": item.url,
 			"show_arrow": item.show_arrow,
 			"filters": item.filters,
+			"route": item.route,
 			"route_options": item.route_options,
 			"tab": item.navigate_to_tab,
 			"open_in_new_tab": item.open_in_new_tab,
 			"is_default_module": item.is_default_module,
 		}
-		# One cached read instead of three uncached ones. A missing report and a disabled report
-		# both end up with no `report` block, so neither needs its own check. `cache=True` stops
-		# the same report on ten sidebars costing ten round trips.
-		if item.link_type == "Report" and item.link_to:
-			report = frappe.db.get_value(
-				"Report",
-				item.link_to,
-				["report_type", "ref_doctype", "disabled"],
-				as_dict=True,
-				cache=True,
-			)
-			if report and not report.disabled:
-				entry["report"] = {
-					"report_type": report.report_type,
-					"ref_doctype": report.ref_doctype,
-				}
+		# Carried only when set, which is almost never. This runs for every item of every
+		# module on every boot, and a key on each one saying "not hidden" is bytes on the
+		# largest thing in the bootinfo. `resolve_layers` seeds the hidden map with `.get`, so
+		# an absent key and a false one say the same thing to the merge.
+		if item.hidden:
+			entry["hidden"] = 1
+
+		attach_report(entry, item.link_type, item.link_to)
 
 		filtered.append(entry)
 
 	return filtered
+
+
+def attach_report(entry: dict, link_type: str | None, link_to: str | None) -> dict:
+	"""Give a Report row the report facts the desk needs to build its route.
+
+	`frappe.ui.sidebar_item.get_route` cannot route a Report row without them: whether the report
+	is a query report decides between `query-report/<name>` and a report view on its ref doctype,
+	and a row with no `report` block gets no route at all, so it draws as a dead link.
+
+	Every row that reaches a sidebar goes through here, whether an app shipped it or a layer added
+	it. They arrive by different paths, `filter_sidebar_items` and `shape_added_item`, and a row a
+	user added is a link like any other once it is on screen.
+
+	One cached read instead of three uncached ones. A missing report and a disabled report both end
+	up with no `report` block, so neither needs its own check. `cache=True` stops the same report on
+	ten sidebars costing ten round trips.
+	"""
+	if link_type != "Report" or not link_to:
+		return entry
+
+	report = frappe.db.get_value(
+		"Report",
+		link_to,
+		["report_type", "ref_doctype", "disabled"],
+		as_dict=True,
+		cache=True,
+	)
+	if report and not report.disabled:
+		entry["report"] = {
+			"report_type": report.report_type,
+			"ref_doctype": report.ref_doctype,
+		}
+
+	return entry
 
 
 def allowed_added_item(item: dict, perm_ctx) -> bool:
@@ -1602,20 +2221,23 @@ def allowed_added_item(item: dict, perm_ctx) -> bool:
 	return is_item_allowed(item.get("link_to"), item.get("link_type"), perm_ctx)
 
 
-def append_derived_items(items, rows, perm_ctx):
-	"""Add `rows` to an already-resolved sidebar, skipping anything it already has.
+def append_derived_items(items, rows, perm_ctx, hidden=()):
+	"""Add `rows` to an already-resolved sidebar, skipping anything it already has or hid.
 
 	These items go through the same shaping and permission check as any other row. Once in the
 	payload they behave like any other item; the only difference is that no document holds them.
 
-	The skip keeps a site that stored these rows before they were computed from drawing two
-	links. The stored row is already in `items`, wherever its customization put it, and the
-	computed one is the duplicate.
+	The skip keeps a row and its derived twin from drawing two links. The stored row is already in
+	`items`, wherever its layer put it, and the derived one is the duplicate.
+
+	`hidden` is the keys the layers hid, which are not in `items` and must not come back through
+	here. Without it a hide could never stick: the item would be missing on the next boot, so this
+	would read it as one nothing names and append it again.
 	"""
 	if not rows:
 		return items
 
-	seen = {item["key"] for item in items}
+	seen = {item["key"] for item in items} | set(hidden)
 	for entry in filter_sidebar_items(rows, perm_ctx):
 		if entry["key"] in seen:
 			continue
@@ -1652,12 +2274,18 @@ def get_module_landing_route(items: list[dict]) -> str | None:
 		return None
 
 	if item.get("link_type") == "Workspace":
-		public = frappe.db.get_value("Workspace", item["link_to"], "public")
-		if public is None:
+		page = frappe.db.get_value("Workspace", item["link_to"], ["public", "title"], as_dict=True)
+		if not page:
 			return None
 
-		prefix = "/desk/" if public else "/desk/private/"
-		return prefix + frappe.utils.slug(item["link_to"])
+		if page.public:
+			return "/desk/" + frappe.utils.slug(item["link_to"])
+
+		# A private page is spelled by its title, not its name: the name carries the owner's email
+		# (`<title>-<user>`) and only the owner can open the page, so the email in the URL named
+		# something the reader already was. The shell is left off, the way it is for a public page:
+		# the desk writes one in on arrival, and a private page's own shell is `Private`.
+		return "/desk/private/" + frappe.utils.slug(page.title)
 
 	if item.get("link_type") == "DocType":
 		return doctype_landing_route(item)
@@ -1683,3 +2311,292 @@ def doctype_landing_route(item: dict) -> str | None:
 		route += f"#{item['tab']}"
 
 	return route
+
+
+# The kinds of thing a desk route can name, each a `Sidebar Item.link_type`. `URL` is absent
+# because a URL row points outside the desk and has no shell to open in. `Workspace` is absent
+# because the desk already holds the answer: which shell a workspace belongs to is stored on the
+# shell, in `module_sidebars[shell].workspaces`, and the desk reads it there
+# (`module_for_workspace`). Shipping it again would be a second copy of one fact, and the two
+# could disagree. The map is still built here, because `home_shell` needs it to place the user's
+# default workspace, and it stays on the server.
+ROUTABLE_ENTITY_KINDS = ("DocType", "Report", "Page", "Dashboard")
+
+
+def build_canonical_shells(
+	module_sidebars: dict,
+	entity_module: dict,
+	perm_ctx: DeskViews,
+	default_workspace: str | None = None,
+) -> tuple[dict, str | None]:
+	"""Map everything a desk route can name to the one shell it opens in.
+
+	A desk URL carries a shell: `/desk/stock/item`. Usually the shell comes from the URL itself,
+	or from the shell the user is already standing in. This answers the case where neither says
+	anything: a bare `/desk/item`, a URL naming a shell that cannot show the entity, and the
+	server's own URL builders, since a background job sending an email is standing nowhere.
+
+	It is the desk's resolution ladder with its two per-browser inputs taken out: the sidebar on
+	screen, and the last one the user picked. What is left depends only on the site and the user,
+	so it can be worked out once here and reads the same on every device.
+
+	The order is the ladder's own:
+
+	  owned          an item flagged `is_default_module` claims the entity
+	  module+listed  the entity's module has a shell, and that shell lists the entity
+	  module+computed  its shell was computed, so not listing the entity decides nothing
+	  heir+listed    the module ships no navigation, and an heir it declared lists the entity
+	  linked         some shell lists the entity
+	  heir+default   the module ships no navigation, so its first heir takes it
+	  module         the entity's module has a shell, which does not list it
+
+	Do not drop `linked`. It reads as redundant beside `module`, since a module usually has a
+	shell of its own, and taking it out moves a hundred entities on an erpnext and hrms site.
+	`Appraisal` is the shape of it: its module is `HR`, `HR` has a shell, but hrms split its
+	navigation into semantic modules and `Performance` is what lists `Appraisal`. Without this
+	step every one of those lands back in `HR`, which is the arrangement the split replaced.
+
+	Keyed by kind first, because entity names are not unique across kinds. `Attendance` is a
+	Dashboard and a DocType, and `Project`, `Selling` and `Stock` each name both a Dashboard and
+	a doctype. A flat map answers one of each pair wrong, whichever order it was built in.
+
+	Workspaces are not in the map. A workspace belongs to the shell listing it in `workspaces`,
+	which is a stored fact the desk already has, so it is resolved here only for `home_shell`
+	and never shipped.
+
+	Everything read here is already filtered for this user, so the map can only name a shell and
+	an entity they may see. Two users may correctly get different answers, and one who cannot see
+	the winning shell falls to the next claim rather than to nothing.
+
+	The shape is entity to shell, which is the question the router asks. Turning it inside out,
+	shell to a list of entities, was measured at 7.8KB gzipped against 9.3KB on a site with
+	erpnext and hrms, out of 72KB of boot. Two percent is not worth a payload the desk has to
+	invert before it can read it, and the router needs the answer while parsing a route.
+
+	The map is total: every entity the user can read gets a shell. Read comes from DocPerm and
+	the shells come from module visibility, and the two do not agree. A user who may only see
+	Selling can still read `Item`, `Company` and `Dashboard`, and has to, because their Sales
+	Orders link to them. Every step of the ladder needs a shell that lists the entity or belongs
+	to its module, so for that user it answers for only a small part of what they can open. On
+	erpnext.site, `sales-repro@example.com` could read 151 doctypes and the ladder placed 16. The
+	rest opened with no sidebar at all. So two last steps follow the ladder:
+
+	  same app       a shell of the entity's own app, which is how the desk already treats
+	                 moving around inside one app (see `crosses_app` on the client)
+	  home           the user's home shell, see `home_shell`
+
+	Returns the map and the home shell. The desk needs the home shell too, for a route that
+	names nothing, and it has to be the same one that was used here.
+
+	`default_workspace` is the user's own, by name. The boot has already read it by the time this
+	runs (`bootinfo.user.default_workspace`), so it is passed in rather than read a second time.
+	"""
+	shells = ShellIndex(module_sidebars)
+	canonical = {kind: {} for kind in ROUTABLE_ENTITY_KINDS}
+	homeless = []
+
+	entities_by_kind = routable_entities(perm_ctx)
+	entities_by_kind["Page"] |= shells.page_routes(entities_by_kind["Page"])
+
+	for kind, entities in entities_by_kind.items():
+		for name, module in entities.items():
+			# `entity_module` is the flat `is_default_module` map the desk already reads, so the
+			# owned step answers exactly what the client's does. It is flat rather than keyed by
+			# kind, so an entity sharing a name with one of another kind takes that claim too.
+			# One entity on an erpnext and hrms site is claimed at all, so this is noted rather
+			# than worked around; keying it would change a payload the desk reads today.
+			shell = entity_module.get(name) if entity_module.get(name) in shells.all else None
+			shell = shell or shells.resolve(kind, name, module)
+			if shell:
+				canonical[kind][name] = shell
+			else:
+				homeless.append((kind, name, module))
+
+	# Worked out before the homeless are placed, so it counts only what the ladder decided.
+	home = home_shell(module_sidebars, canonical, dict(shells.workspace_owners()), default_workspace)
+
+	for kind, name, module in homeless:
+		shell = shells.shell_of_app(app_of_module(module)) or home
+		if shell:
+			canonical[kind][name] = shell
+
+	return canonical, home
+
+
+def home_shell(
+	module_sidebars: dict, canonical: dict, workspace_shells: dict, default_workspace: str | None = None
+) -> str | None:
+	"""The shell a user is taken to when nothing else says where to go.
+
+	The shell of the user's default workspace, if they set one and can see it. Otherwise the
+	shell the ladder placed the most entities in, which is where this user's work actually is:
+	for a user who may only see Selling it is Selling, not whichever of their shells sorts first
+	(`Custom Workspaces`). Ties go to the one earlier in the payload, so the answer is the same
+	on every boot.
+
+	`workspace_shells` is the workspace-to-shell map, passed in rather than read from `canonical`
+	because it is not shipped (see `ROUTABLE_ENTITY_KINDS`). A default workspace missing from it
+	is one this user cannot reach, so the count answers instead.
+
+	Nothing here reads the database. The default workspace comes from the caller, which is what
+	lets the boot hand over the value it already loaded.
+	"""
+	if not module_sidebars:
+		return None
+
+	if default_workspace and (shell := workspace_shells.get(default_workspace)):
+		return shell
+
+	placed = Counter(shell for found in canonical.values() for shell in found.values())
+	# The Private shell holds no entity, so the count can never choose it, and it must not win a
+	# tie either: home is where this user's work is, and their own pages are not where a route
+	# naming nothing should land. It is still their home when they made it their default workspace,
+	# which the step above answers.
+	candidates = [shell for shell in module_sidebars if shell != PRIVATE_MODULE] or list(module_sidebars)
+	return max(candidates, key=lambda shell: placed[shell])
+
+
+def app_of_module(module: str | None) -> str | None:
+	if not module:
+		return None
+	return (frappe.local.module_app or {}).get(frappe.scrub(module))
+
+
+class ShellIndex:
+	"""The questions the ladder asks of the payload, each answered from one pass over it.
+
+	Built once per boot rather than per entity: the ladder runs for every doctype, report, page
+	and dashboard the user can see, and walking every shell's items inside that loop would be
+	quadratic on a site with seventy shells.
+	"""
+
+	def __init__(self, module_sidebars: dict):
+		self.all = module_sidebars
+		self.listing = {}
+		self.of_module = {}
+		self.of_workspace = {}
+		self.of_app = {}
+		# Shells built from what their module holds rather than shipped by an app. See `resolve`.
+		self.computed = {shell for shell, sidebar in module_sidebars.items() if sidebar.get("computed")}
+
+		for shell, sidebar in module_sidebars.items():
+			for item in sidebar["items"]:
+				kind = item.get("link_type")
+				for entity in linked_entities(item) if kind else ():
+					self.listing.setdefault((kind, entity), []).append(shell)
+			# A shell keyed by its module answers for that module; the naming rule makes that the
+			# usual case. A renamed shell is found through the column it stores its module in,
+			# and where a module owns several, the first in the payload's order answers, which is
+			# what `sidebar_for_module` does on the client.
+			module = sidebar.get("module")
+			if module:
+				self.of_module.setdefault(module, shell)
+			# The first shell of each app, in the payload's order. A shell the user made has no
+			# app, so it never stands in for one.
+			if sidebar.get("app"):
+				self.of_app.setdefault(sidebar["app"], shell)
+			for workspace in sidebar.get("workspaces") or []:
+				self.of_workspace.setdefault(workspace, shell)
+
+		# Where a code-only module's navigation went, resolved to shells once. `resolve` runs for
+		# every entity the user can see, `get_code_only_module_heirs` rebuilds its dict on every
+		# call, and `shell_of` is a lookup per heir -- so asking per entity was the same answer
+		# worked out a thousand times. Only the modules that declared an heir are in here, and a
+		# module whose heirs this user cannot see keeps an empty list, which reads the same as
+		# having none.
+		self.heirs = {
+			module: [shell for heir in heirs if (shell := self.shell_of(heir))]
+			for module, heirs in get_code_only_module_heirs().items()
+		}
+
+	def workspace_owners(self):
+		return self.of_workspace.items()
+
+	def shell_of(self, module: str | None) -> str | None:
+		if not module:
+			return None
+		return module if module in self.all else self.of_module.get(module)
+
+	def shell_of_app(self, app: str | None) -> str | None:
+		return self.of_app.get(app) if app else None
+
+	def listed_in(self, kind: str, entity: str) -> list[str]:
+		return self.listing.get((kind, entity), [])
+
+	def page_routes(self, pages: dict[str, str]) -> dict[str, str]:
+		"""Every page route a shell lists, of a page in `pages`, mapped to that page's module."""
+		routes = {}
+		for kind, entity in self.listing:
+			if kind != "Page":
+				continue
+			page, _, route = entity.partition("/")
+			if route and page in pages:
+				routes[entity] = pages[page]
+		return routes
+
+	def resolve(self, kind: str, entity: str, module: str | None) -> str | None:
+		"""The ladder itself, from `module+listed` down. The `owned` step is above this."""
+		# A row in the Private shell is a shortcut one person kept, not a claim on where the entity
+		# belongs. Counted as one, pinning `Job Offer` there moved it out of `Recruitment`.
+		listed = [shell for shell in self.listed_in(kind, entity) if shell != PRIVATE_MODULE]
+		own = self.shell_of(module)
+
+		if own and own in listed:
+			return own
+
+		# Not listing something only means something when someone chose what the sidebar lists. A
+		# computed sidebar lists what its module holds, capped at COMPUTED_DOCTYPE_LIMIT, so an
+		# entity missing from one was not left out, it fell past a display limit. Reading that as a
+		# decision would hand the entity to whichever other shell happens to link it. A module
+		# always contains its own entities, so a computed sidebar answers for them regardless.
+		#
+		# This matters for exactly the modules nobody wrote a sidebar for, which is every module a
+		# customer adds. A site whose apps all ship one has no computed shells at all, which is why
+		# leaving this out looked harmless.
+		if own and own in self.computed:
+			return own
+
+		heirs = self.heirs.get(module) or []
+		for heir in heirs:
+			if heir in listed:
+				return heir
+
+		if listed:
+			return listed[0]
+
+		# An heir with no claim still beats nothing: the module said where its navigation went,
+		# and landing an unlisted entity in a shell of that app is better than landing nowhere.
+		return heirs[0] if heirs else own
+
+
+def routable_entities(perm_ctx: DeskViews) -> dict[str, dict[str, str]]:
+	"""Every entity of every kind this user can reach, mapped to the module it belongs to.
+
+	A system page is left out. It is part of the desk rather than of a module, so it opens in no
+	shell and the desk keeps its URL bare (`Page.system_page`).
+
+	Each kind is read from what the boot already builds for it, so the set is filtered the same
+	way the desk filters it and nothing here has to repeat a permission rule. Doctypes are the
+	exception, having no such payload: they come from the user's own read list, minus child
+	tables, which are never routed to.
+	"""
+	# One read of the table, filtered in Python. Passing the read list as an `IN` would put over a
+	# thousand names into the statement on a site with everything installed, to select most of a
+	# table this size.
+	readable = set(perm_ctx.can_read or ())
+	doctypes = {
+		row.name: row.module
+		for row in frappe.get_all("DocType", filters={"istable": 0}, fields=["name", "module"])
+		if row.name in readable
+	}
+
+	return {
+		"DocType": doctypes,
+		"Report": {name: row.get("module") for name, row in (perm_ctx.allowed_reports or {}).items()},
+		"Page": {
+			name: row.get("module")
+			for name, row in (perm_ctx.allowed_pages or {}).items()
+			if not row.get("system_page")
+		},
+		"Dashboard": {row["name"]: row.get("module") for row in perm_ctx.get_allowed_dashboards(cache=True)},
+	}

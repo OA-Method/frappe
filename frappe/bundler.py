@@ -2,6 +2,7 @@
 # License: MIT. See LICENSE
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from contextlib import suppress
@@ -10,6 +11,7 @@ import click
 from semantic_version import Version
 
 import frappe
+import frappe.commands
 
 timestamps = {}
 app_paths = None
@@ -131,7 +133,95 @@ def watch(apps=None):
 
 	check_node_executable()
 	frappe_app_path = frappe.get_app_source_path("frappe")
-	frappe.commands.popen(command, cwd=frappe_app_path, env=get_node_env())
+
+	# The island watchers, on their own tooling, beside esbuild rather than inside
+	# it. They live exactly as long as the esbuild watcher below, which blocks.
+	# Each would install the toolchain it lacks, so it is installed once, before both.
+	islands = []
+	if frappe.commands.popen(
+		island_build_command("install-toolchain.js"), cwd=frappe_app_path, env=get_node_env()
+	):
+		click.secho("The island toolchain did not install, so islands are not watched.", fg="yellow")
+	else:
+		islands = [watch_islands(script) for script in ("build-framework.js", "build-pages.js")]
+	try:
+		frappe.commands.popen(command, cwd=frappe_app_path, env=get_node_env())
+	finally:
+		for process in islands:
+			if process:
+				process.terminate()
+
+
+def island_build_command(script: str, production: bool = False, watch: bool = False) -> str:
+	"""A framework island build in `ui/vite/island/`, as a shell command.
+
+	It runs on framework's own toolchain, installed beside `ui/`, so it
+	needs neither an app frontend nor the bench's node_modules.
+	"""
+	script = os.path.join(frappe.get_app_source_path("frappe"), "ui", "vite", "island", script)
+	command = f"node {shlex.quote(script)}"
+	if production:
+		command += " --production"
+	if watch:
+		command += " --watch"
+	return command
+
+
+def build_framework_islands(production: bool = False):
+	"""Build the islands desk draws by default, such as `frappe.chart`.
+
+	Raises on failure, so `bench build` fails: unlike a page island, desk draws
+	these without anyone opting in.
+	"""
+	frappe_app_path = frappe.get_app_source_path("frappe")
+	command = island_build_command("build-framework.js", production=production)
+
+	if frappe.commands.popen(command, cwd=frappe_app_path, env=get_node_env()):
+		toolchain = os.path.join(frappe_app_path, "island-toolchain")
+		raise click.ClickException(
+			f"The framework island build failed ({command}). Desk cannot draw its charts until this passes. "
+			f"If the island toolchain did not install, run: yarn install --production=false --cwd {toolchain}"
+		)
+
+
+def build_page_islands(built_apps: list[str] | None = None):
+	"""Build every Frappe UI page's island. Runs from the `after_app_build` hook.
+
+	One build takes the whole bench, so which app was just built does not change
+	what it compiles. A failure is reported and does not stop `bench build`: a
+	page island is additive, and an unbuilt one already says so on its own page.
+	"""
+	# The same reading `bench build` uses to pick its own mode.
+	development = frappe.local.conf.developer_mode or frappe._dev_server
+	command = island_build_command("build-pages.js", production=not development)
+
+	if frappe.commands.popen(command, cwd=frappe.get_app_source_path("frappe"), env=get_node_env()):
+		click.secho(
+			f"The page-island build failed ({command}). "
+			"Every Frappe UI page shows its unbuilt state until this passes.",
+			fg="red",
+		)
+
+
+def watch_islands(script: str):
+	"""Start the watcher of an island build, or `None` if it cannot start.
+
+	`frappe.commands.popen` waits, and this one has to run beside the esbuild
+	watcher, so it starts its own process. The environment is merged the same
+	way, or node is not on the PATH the build inherits.
+	"""
+	command = island_build_command(script, watch=True)
+
+	try:
+		return subprocess.Popen(
+			command,
+			shell=True,
+			cwd=frappe.get_app_source_path("frappe"),
+			env=dict(os.environ, **get_node_env()),
+		)
+	except OSError as e:
+		click.secho(f"Could not watch islands ({script}): {e}", fg="yellow")
+		return None
 
 
 def check_node_executable():
@@ -200,6 +290,16 @@ def generate_assets_map():
 	return symlinks
 
 
+def remove_stale_island_toolchain():
+	"""Remove the page-island toolchain an older build installed inside `ui/`.
+
+	Its link to `@framework/ui` makes `ui/` contain itself, so copying the assets
+	of any app that links the package never ends.
+	"""
+	stale = os.path.join(frappe.get_app_source_path("frappe"), "ui", "vite", "island", "toolchain")
+	shutil.rmtree(stale, ignore_errors=True)
+
+
 def setup_assets_dirs():
 	for dir_path in (os.path.join(assets_path, x) for x in ("js", "css")):
 		os.makedirs(dir_path, exist_ok=True)
@@ -229,6 +329,7 @@ def unstrip(message: str) -> str:
 
 
 def make_asset_dirs(hard_link=False, verbose=True):
+	remove_stale_island_toolchain()
 	setup_assets_dirs()
 	clear_broken_symlinks()
 	symlinks = generate_assets_map()
