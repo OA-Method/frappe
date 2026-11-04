@@ -26,7 +26,7 @@ dependencies = [
     "PyMySQL==1.1.2",
     # 6.21.2: five advisories in 6.19.0 (infinite loops, memory use, unvalidated JPEG
     # data; GHSA-39mj-jf6j-2qj3 et al.). Fork patch, PR-Foundry/framework#283; upstream pins 6.20.1.
-    "pypdf==6.21.2",
+    "pypdf==6.21.4",
     "PyPika @ git+https://github.com/frappe/pypika@054ffb18a0a60f3c3f472dcce86116fd86db1188",
     "mysqlclient==2.3.0",
     "PyQRCode~=1.2.1",
