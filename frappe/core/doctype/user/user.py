@@ -1123,7 +1123,7 @@ def update_password(
 	if user_doc.user_type == "System User":
 		return get_default_path() or "/desk"
 	else:
-		return redirect_url or get_default_path() or get_home_page()
+		return redirect_url or get_home_page()
 
 
 @frappe.whitelist(allow_guest=True)

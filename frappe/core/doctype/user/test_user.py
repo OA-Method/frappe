@@ -798,6 +798,25 @@ class TestUser(IntegrationTestCase):
 			"The reset password link has been expired",
 		)
 
+	def test_website_user_is_sent_home_not_to_the_apps_screen(self):
+		from frappe.auth import CookieManager, LoginManager
+		from frappe.utils import set_request
+		from frappe.website.utils import get_home_page
+
+		set_request(path="/random")
+		frappe.local.cookie_manager = CookieManager()
+		frappe.local.login_manager = LoginManager()
+		frappe.local.request_ip = "127.0.0.69"
+		apps = [{"name": "app_one", "route": "/app_one"}, {"name": "app_two", "route": "/app_two"}]
+
+		frappe.set_user("test2@example.com")
+		home_page = get_home_page()
+		test_user = frappe.get_doc("User", "test2@example.com")
+		with patch("frappe.apps.get_apps", return_value=apps):
+			key = self.reset_password(test_user)
+			self.assertEqual(update_password("Eastern_43A1W_home", key=key), home_page)
+			self.assertEqual(frappe.local.response["home_page"], "/" + home_page)
+
 	@unimplemented_for(db_type_is.SQLITE)
 	def test_reset_password_key_cannot_be_used_by_a_concurrent_request(self):
 		from frappe.auth import CookieManager, LoginManager
