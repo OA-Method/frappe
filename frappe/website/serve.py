@@ -29,11 +29,17 @@ def handle_exception(e, endpoint, path, http_status_code):
 	if isinstance(e, frappe.Redirect):
 		return RedirectPage(endpoint or path, e.http_status_code).render()
 
+	# The request's code is 200 unless a caller says otherwise, and `code or 404` keeps a 200:
+	# a renderer that raised PageDoesNotExistError answered the Not Found page with status 200,
+	# so a missing /file/ was cached and indexed as a page (PR-Foundry/framework#368). Only an
+	# error code the caller passed in explicitly survives; anything else is the exception's own.
+	error_code = http_status_code if http_status_code and http_status_code >= 400 else None
+
 	if isinstance(e, frappe.PermissionError):
-		return NotPermittedPage(endpoint, http_status_code, exception=e).render()
+		return NotPermittedPage(endpoint, error_code or 403, exception=e).render()
 
 	if isinstance(e, frappe.PageDoesNotExistError):
-		return NotFoundPage(endpoint, http_status_code).render()
+		return NotFoundPage(endpoint, error_code or 404).render()
 
 	page = ErrorPage(exception=e)
 	# A rendered error page is a handled exception, so app.py's ">= 500 -> log" rule never
